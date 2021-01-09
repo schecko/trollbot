@@ -170,7 +170,6 @@ impl State {
 
 pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Result<()> {
     loop {
-        println!("loop");
         match runner.next_message().await? {
             // this is the parsed message -- across all channels (and notifications from Twitch)
             Status::Message(msg) => {
