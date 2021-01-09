@@ -9,5 +9,6 @@ edition = "2018"
 [dependencies]
 twitchchat = { version = "0.14", features = [ "async", "tokio", "tokio-util", "tokio-rustls", "webpki-roots" ] }
 anyhow = "1.0"
-tokio = { version = "0.2", features = ["full", "tracing", "time"] }
+tokio = { version = "0.2", features = [ "full", "tracing", "time" ] }
 rand = "0.8"
+strum = { version = "0.20", features = [ "derive" ] }

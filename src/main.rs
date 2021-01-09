@@ -1,26 +1,73 @@
 extern crate tokio;
 extern crate anyhow;
 extern crate rand;
+extern crate strum;
 
-use twitchchat::{ 
+use twitchchat::{
     commands, connector, messages,
     runner::{AsyncRunner, Status},
     UserConfig,
 };
-use anyhow::Context as _; 
+use anyhow::Context as _;
 use std::time::{ Duration, Instant };
 use rand::Rng;
+use strum::*;
 
 const TRIGGERS: &[&str] = &[
-    "cpp",
+    ".net",
+    "abap",
+    "action!",
+    "actionscript",
+    "ada",
+    "ada",
+    "adenine",
+    "adga",
+    "advpl",
+    "agilent",
+    "agora",
+    "aimms",
+    "aldor",
+    "c",
+    "c#",
     "c++",
-    "lua",
+    "clojure",
+    "cobol",
+    "cobol",
+    "cpp",
+    "dart",
+    "delphi",
+    "fortran",
+    "go",
+    "groovy",
+    "haskell",
+    "jai",
     "java",
+    "javascript",
+    "julia",
+    "kotlin",
+    "lisp",
+    "lua",
+    "matlab",
+    "objectivec",
+    "pascal",
+    "perl",
+    "php",
+    "powershell",
+    "prolog",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "scratch",
+    "swift",
+    "typescript",
+    "vba",
+    "visual basic",
 ];
 
 const RESPONSES: &[&str] = &[
-    "Rust is bae",
-    "You Should have chosen rust instead",
+    "Rust is bae.",
+    "You should have chosen Rust instead.",
 ];
 
 const ADVICE: &[&str] = &[
@@ -29,8 +76,8 @@ const ADVICE: &[&str] = &[
     "Eat tendies frequently.",
 ];
 
-const PASSIVE_MESSAGES: bool = false;
-const TRIGGER_MESSAGES: bool = false; 
+const PASSIVE_MESSAGES: bool = true;
+const TRIGGER_MESSAGES: bool = true;
 const COMMAND_MESSAGES: bool = true;
 
 async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<AsyncRunner> {
@@ -38,9 +85,9 @@ async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<Asyn
 
     println!("Connecting...");
     let mut runner = AsyncRunner::connect(connector, user_config).await?;
-    println!("..Connected, attempting to join channel '{}'", channel); 
+    println!("..Connected, attempting to join channel '{}'", channel);
     let _ = runner.join(&channel).await?;
-    println!("joined '{}'!", channel); 
+    println!("joined '{}'!", channel);
 
     Ok(runner)
 }
@@ -49,7 +96,7 @@ async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<Asyn
 async fn main() -> anyhow::Result<()> {
     let (user_config, channel) = get_config()?;
 
-    let runner = connect(&user_config, &channel).await?; 
+    let runner = connect(&user_config, &channel).await?;
     println!("starting main loop");
     let state = State::new(channel);
     main_loop(state, runner).await
@@ -79,16 +126,19 @@ pub fn get_config() -> anyhow::Result<(twitchchat::UserConfig, String)> {
 const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
 const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
 
+#[derive(Display)]
 pub enum Mood {
+    #[strum(to_string = "normal")]
     Normal,
+    #[strum(to_string = "agitated")]
     Backoff,
 }
 
-pub struct State { 
+pub struct State {
     pub channel: String,
     pub mood: Mood,
     pub last_advice: Instant,
-    pub next_advice: Duration, 
+    pub next_advice: Duration,
     pub dedup_message: bool,
 }
 
@@ -103,10 +153,15 @@ impl State {
         }
     }
 
+    fn set_mood(&mut self, mood: Mood)
+    {
+        self.mood = mood;
+    }
+
     async fn send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
         let mut writer = runner.writer();
         let cmd = commands::privmsg(&self.channel, msg);
-        writer.encode(cmd).await.unwrap(); 
+        writer.encode(cmd).await.unwrap();
 
         self.dedup_message = true;
         self.last_advice = Instant::now();
@@ -115,11 +170,12 @@ impl State {
 
 pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Result<()> {
     loop {
+        println!("loop");
         match runner.next_message().await? {
             // this is the parsed message -- across all channels (and notifications from Twitch)
             Status::Message(msg) => {
                 handle_message(&mut state, &mut runner, msg).await;
-            } 
+            }
             Status::Quit => {
                 println!("Quitting.");
                 break;
@@ -130,7 +186,7 @@ pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Res
             }
         }
 
-        if state.last_advice + state.next_advice > Instant::now() {
+        if state.last_advice + state.next_advice < Instant::now() {
             match state.mood {
                 Mood::Normal => {
                     let mut rng = rand::thread_rng();
@@ -140,7 +196,7 @@ pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Res
                     }
                 }
                 Mood::Backoff => {
-                    state.mood = Mood::Normal; 
+                    state.set_mood(Mood::Normal);
                     state.next_advice = PASSIVE_ADVICE_INTERVAL;
                 }
             }
@@ -158,34 +214,47 @@ async fn parse_command(state: &mut State, runner: &mut AsyncRunner, msg: &messag
                 return Ok(());
             }
             "!fuckoff" => {
-                state.send_message(runner, "Fine, I'll fuck off.").await; 
+                state.send_message(runner, "Fine, I'll fuck off.").await;
                 state.next_advice = BACKOFF_ADVICE_INTERVAL;
-                state.mood = Mood::Backoff;
+                state.set_mood(Mood::Backoff);
                 return Ok(());
             }
             "!feed" => {
-                state.send_message(runner, "Mmm I love tendies.").await; 
+                state.send_message(runner, "Mmm I love tendies.").await;
                 return Ok(());
             }
             "!bot" => {
-                state.send_message(runner, "github.com/schecko/cynobot").await; 
+                state.send_message(runner, "github.com/schecko/cynobot").await;
+                return Ok(());
+            }
+            "!mood" => {
+                state.send_message(runner, &format!("Mr/Ms streamer is feeling {}.", state.mood)).await;
+                return Ok(());
+            }
+            "!purpose" => {
+                state.send_message(runner, "My purpose in life is to troll @SomewhatAccurate and his viewers.").await;
+                return Ok(());
+            }
+            "!about" => {
+                state.send_message(runner, "https://www.youtube.com/watch?v=dQw4w9WgXcQ").await;
                 return Ok(());
             }
             _ => {}
-        } 
+        }
     }
-        
+
     if TRIGGER_MESSAGES {
         println!("scanning triggers");
+        let lower_case = msg.data().to_lowercase();
         for trigger in TRIGGERS {
-            if msg.data().contains(trigger) {
+            if lower_case.contains(trigger) {
                 println!("found trigger");
                 let mut rng = rand::thread_rng();
                 let msg = RESPONSES[rng.gen::<usize>() % RESPONSES.len()];
-                state.send_message(runner, msg).await; 
+                state.send_message(runner, msg).await;
                 break;
             }
-        } 
+        }
     }
 
     Ok(())
