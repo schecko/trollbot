@@ -14,11 +14,8 @@ use rand::Rng;
 use strum::*;
 
 const TRIGGERS: &[&str] = &[
-    ".net",
     "abap",
-    "action!",
     "actionscript",
-    "ada",
     "ada",
     "adenine",
     "adga",
@@ -32,10 +29,10 @@ const TRIGGERS: &[&str] = &[
     "c++",
     "clojure",
     "cobol",
-    "cobol",
     "cpp",
     "dart",
     "delphi",
+    "erlang",
     "fortran",
     "go",
     "groovy",
@@ -59,6 +56,7 @@ const TRIGGERS: &[&str] = &[
     "rust",
     "scala",
     "scratch",
+    "sfortran",
     "swift",
     "typescript",
     "vba",
@@ -243,16 +241,15 @@ async fn parse_command(state: &mut State, runner: &mut AsyncRunner, msg: &messag
     }
 
     if TRIGGER_MESSAGES {
-        println!("scanning triggers");
         let lower_case = msg.data().to_lowercase();
-        for trigger in TRIGGERS {
-            if lower_case.contains(trigger) {
-                println!("found trigger");
+        // todo ignore punctuation?
+        for token in lower_case.split_whitespace() {
+            if TRIGGERS.iter().find(|&&trigger| trigger == token).is_some() {
                 let mut rng = rand::thread_rng();
                 let msg = RESPONSES[rng.gen::<usize>() % RESPONSES.len()];
                 state.send_message(runner, msg).await;
                 break;
-            }
+            } 
         }
     }
 
