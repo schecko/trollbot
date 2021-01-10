@@ -40,40 +40,53 @@ pub struct MultiTrigger<'a> {
     value: MapValue<'a>, 
 }
 
-fn load_map<'a>(contents: &'a str) -> (Vec<MultiTrigger<'a>>, HashMap<&'a str, MapValue<'a>>) {
+// limitation: keys generated from values that contain capitals will never be tolowered, so those
+// keys will always fail to compare
+fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (Vec<MultiTrigger<'a>>, HashMap<&'a str, MapValue<'a>>) {
     let mut map = HashMap::new();
     let mut multi_triggers = Vec::new();
     for line in contents.lines() {
         let mut split = line.split('='); 
-        if let (Some(key), Some(value)) = (split.next(), split.next()) {
-            if key.len() == 0 { continue; }
+        if let (Some(meta_key), Some(value)) = (split.next(), split.next()) {
+            if meta_key.len() == 0 { continue; }
             if value.len() == 0 { continue; }
 
-            let map_value = if let Some('[') = value.chars().next() {
-                MapValue::FileName(&value[1..]) 
+            let single = vec![meta_key];
+            let keys = if let Some('[') = meta_key.chars().next() {
+                lists.get(&meta_key[1..]).unwrap()
             } else {
-                MapValue::Value(value) 
+                &single
             };
 
-            if key.contains(' ') {
-                let mut multi_split = key.split(' ');
+            'key_loop: for key in keys { 
+                if key.contains('{') { continue 'key_loop; }
 
-                let first = multi_split.next();
-                let second = multi_split.next();
-                if first == None { continue; }
-                if second == None { continue; }
+                let map_value = if let Some('[') = value.chars().next() {
+                    MapValue::FileName(&value[1..]) 
+                } else {
+                    MapValue::Value(value) 
+                };
 
-                multi_triggers.push(MultiTrigger { 
-                    triggers: [
-                        first.unwrap(),
-                        second.unwrap(),
-                        multi_split.next().unwrap_or(""),
-                        multi_split.next().unwrap_or(""),
-                    ],
-                    value: map_value,
-                }); 
-            } else {
-                map.insert(key, map_value);
+                if key.contains(' ') {
+                    let mut multi_split = key.split(' ');
+
+                    let first = multi_split.next();
+                    let second = multi_split.next();
+                    if first == None { continue 'key_loop; }
+                    if second == None { continue 'key_loop; }
+
+                    multi_triggers.push(MultiTrigger { 
+                        triggers: [
+                            first.unwrap(),
+                            second.unwrap(),
+                            multi_split.next().unwrap_or(""),
+                            multi_split.next().unwrap_or(""),
+                        ],
+                        value: map_value,
+                    }); 
+                } else {
+                    map.insert(*key, map_value);
+                }
             }
         }
     } 
@@ -126,9 +139,6 @@ async fn main() -> anyhow::Result<()> {
     let runner = connect(&user_config, &channel).await?;
     println!("starting main loop"); 
 
-    let triggers_content = load_file_rel(TRIGGERS_FILE)?;
-    let (multi_triggers, triggers) = load_map(&triggers_content); 
-
     let dir = fs::read_dir(data_dir()?)?;
     let mut contents = Vec::new();
     let mut map = HashMap::new();
@@ -140,10 +150,18 @@ async fn main() -> anyhow::Result<()> {
             contents.push((String::from(path.file_stem().unwrap().to_str().unwrap()), content));
         }
     } 
+
     let contents = contents;
     for content in &contents {
         map.insert(&content.0[..], load_list(&content.1)); 
     }
+
+    let triggers_content = load_file_rel(TRIGGERS_FILE)?;
+    let (multi_triggers, triggers) = load_map(&triggers_content, &map); 
+
+    println!("lists {:#?}", map);
+    println!("multi triggers {:#?}", multi_triggers);
+    println!("triggers {:#?}", triggers);
 
     let state = State::new(channel, triggers, multi_triggers, map);
 
