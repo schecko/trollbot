@@ -34,21 +34,50 @@ pub enum MapValue<'a> {
     Value(&'a str),
 }
 
-fn load_map<'a>(contents: &'a str) -> HashMap<&'a str, MapValue<'a>> {
+#[derive(Debug)]
+pub struct MultiTrigger<'a> {
+    triggers: [&'a str; 4],
+    value: MapValue<'a>, 
+}
+
+fn load_map<'a>(contents: &'a str) -> (Vec<MultiTrigger<'a>>, HashMap<&'a str, MapValue<'a>>) {
     let mut map = HashMap::new();
+    let mut multi_triggers = Vec::new();
     for line in contents.lines() {
         let mut split = line.split('='); 
         if let (Some(key), Some(value)) = (split.next(), split.next()) {
             if key.len() == 0 { continue; }
             if value.len() == 0 { continue; }
-            if let Some('[') = value.chars().next() {
-                map.insert(key, MapValue::FileName(&value[1..])); 
+
+            let map_value = if let Some('[') = value.chars().next() {
+                MapValue::FileName(&value[1..]) 
             } else {
-                map.insert(key, MapValue::Value(value)); 
+                MapValue::Value(value) 
+            };
+
+            if key.contains(' ') {
+                let mut multi_split = key.split(' ');
+
+                let first = multi_split.next();
+                let second = multi_split.next();
+                if first == None { continue; }
+                if second == None { continue; }
+
+                multi_triggers.push(MultiTrigger { 
+                    triggers: [
+                        first.unwrap(),
+                        second.unwrap(),
+                        multi_split.next().unwrap_or(""),
+                        multi_split.next().unwrap_or(""),
+                    ],
+                    value: map_value,
+                }); 
+            } else {
+                map.insert(key, map_value);
             }
         }
     } 
-    map 
+    (multi_triggers, map)
 }
 
 const ADVICE: &[&str] = &[
@@ -98,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     println!("starting main loop"); 
 
     let triggers_content = load_file_rel(TRIGGERS_FILE)?;
-    let triggers = load_map(&triggers_content); 
+    let (multi_triggers, triggers) = load_map(&triggers_content); 
 
     let dir = fs::read_dir(data_dir()?)?;
     let mut contents = Vec::new();
@@ -116,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
         map.insert(&content.0[..], load_list(&content.1)); 
     }
 
-    let state = State::new(channel, triggers, map);
+    let state = State::new(channel, triggers, multi_triggers, map);
 
     main_loop(state, runner).await
 }
@@ -154,23 +183,30 @@ pub enum Mood {
 
 pub struct State<'a> {
     pub channel: String,
-    pub mood: Mood,
-    pub last_advice: Instant,
-    pub next_advice: Duration,
     pub dedup_message: bool,
+    pub last_advice: Instant,
     pub lists: HashMap<&'a str, Vec<&'a str>>,
+    pub mood: Mood,
+    pub multi_triggers: Vec<MultiTrigger<'a>>,
+    pub next_advice: Duration,
     pub triggers: HashMap<&'a str, MapValue<'a>>,
 }
 
 impl<'a> State<'a> {
-    fn new(channel: String, triggers: HashMap<&'a str, MapValue<'a>>, lists: HashMap<&'a str, Vec<&'a str>>) -> Self {
+    fn new(
+        channel: String, 
+        triggers: HashMap<&'a str, MapValue<'a>>, 
+        multi_triggers: Vec<MultiTrigger<'a>>, 
+        lists: HashMap<&'a str, Vec<&'a str>>
+    ) -> Self {
         State {
             channel,
-            mood: Mood::Normal,
-            last_advice: Instant::now(),
-            next_advice: PASSIVE_ADVICE_INTERVAL,
             dedup_message: false,
+            last_advice: Instant::now(),
             lists,
+            mood: Mood::Normal,
+            multi_triggers,
+            next_advice: PASSIVE_ADVICE_INTERVAL,
             triggers,
         }
     }
@@ -276,6 +312,28 @@ fn substitute_random(state: &State<'_>, message: &str) -> String {
     result 
 }
 
+fn make_response(state: &State<'_>, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
+    match map_value{
+        MapValue::FileName(name) => {
+            if let Some(list) = state.lists.get(*name) {
+                let mut rng = rand::thread_rng();
+                let msg = list[rng.gen::<usize>() % list.len()];
+                println!("detected file {}", name);
+                let mut result = substitute_random(state, msg);
+                result = result.replace("{trigger}", trigger);
+                return Some(result);
+            }
+        }
+        MapValue::Value(value) => {
+            println!("detected value {}", value);
+            let mut result = substitute_random(state, value);
+            result = result.replace("{trigger}", trigger);
+            return Some(result);
+        }
+    } 
+    return None;
+}
+
 async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     if COMMAND_MESSAGES {
         match msg.data() {
@@ -314,34 +372,48 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
     }
 
     if TRIGGER_MESSAGES { 
-        println!("triggers {:?}", state.triggers);
-        println!("lists {:?}", state.lists);
+        println!("triggers {:#?}", state.triggers);
+        println!("lists {:#?}", state.lists);
+        println!("multi triggers {:#?}", state.multi_triggers);
         let lower_case = msg.data().to_lowercase();
         // todo ignore punctuation?
         for token in lower_case.split_whitespace() {
             match state.triggers.get(token) {
-                Some(MapValue::FileName(name)) => {
-                    if let Some(list) = state.lists.get(*name) {
-                        let mut rng = rand::thread_rng();
-                        let msg = list[rng.gen::<usize>() % list.len()];
-                        println!("detected file {}", name);
-                        let mut result = substitute_random(state, msg);
-                        result = result.replace("{trigger}", token);
-                        state.send_message(runner, &result).await; 
+                Some(value) => {
+                    if let Some(response) = make_response(state, token, value) {
+                        state.send_message(runner, &response).await; 
                     }
-                    break;
-                }
-                Some(MapValue::Value(value)) => {
-                    println!("detected value {}", value);
-                    let mut result = substitute_random(state, value);
-                    result = result.replace("{trigger}", token);
-                    state.send_message(runner, &result).await; 
-                    break;
                 }
                 _ => {}
             }
         }
-        
+
+        let mut opt_response = None;
+        'outer: for multi_trigger in &state.multi_triggers {
+            let mut found = false;
+            'inner: for trigger in &multi_trigger.triggers {
+                if *trigger == "" { 
+                    if found { 
+                        break 'inner;
+                    } else {
+                        continue 'outer; 
+                    }
+                } 
+
+                if lower_case.contains(trigger) {
+                    found = true; 
+                } else {
+                    break 'inner;
+                }
+            }
+
+            if found { 
+                opt_response = make_response(state, multi_trigger.triggers[0], &multi_trigger.value);
+            }
+        }
+        if let Some(response) = opt_response {
+            state.send_message(runner, &response).await; 
+        } 
     }
 
     Ok(())
