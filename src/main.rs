@@ -22,6 +22,7 @@ const TRIGGERS_FILE: &str = "triggers.map";
 fn load_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
     for line in contents.lines() {
+        if line.len() == 0 { continue; }
         data.push(line); 
     } 
     data
@@ -38,6 +39,8 @@ fn load_map<'a>(contents: &'a str) -> HashMap<&'a str, MapValue<'a>> {
     for line in contents.lines() {
         let mut split = line.split('='); 
         if let (Some(key), Some(value)) = (split.next(), split.next()) {
+            if key.len() == 0 { continue; }
+            if value.len() == 0 { continue; }
             if let Some('[') = value.chars().next() {
                 map.insert(key, MapValue::FileName(&value[1..])); 
             } else {
@@ -224,6 +227,55 @@ pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> anyhow:
     Ok(())
 }
 
+struct SubLocations<'a> {
+    original: &'a str,
+    substr: &'a str, 
+    acc: usize,
+}
+
+impl<'a> SubLocations<'a> {
+    fn new(data: &'a str) -> Self {
+        SubLocations {
+            original: data,
+            substr: data,
+            acc: 0
+        }
+    }
+}
+
+impl<'a> Iterator for SubLocations<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(left_bracket) = self.substr.find('{') {
+            if let Some(right_bracket) = self.substr[left_bracket..].find('}') {
+                let result = &self.original[self.acc + left_bracket..self.acc + left_bracket + right_bracket + 1];
+                self.substr = &self.substr[right_bracket..];
+                self.acc += right_bracket;
+                return Some(result);
+            } 
+        }
+        None
+    }
+}
+
+fn substitute_random(state: &State<'_>, message: &str) -> String { 
+    println!("substituting {}", message);
+    let mut result = String::from(message);
+    for substitution in SubLocations::new(message) {
+        println!("found substitution location {}", substitution);
+        if substitution.len() < 3 { continue; }
+        if let Some(list) = state.lists.get(&substitution[1..substitution.len() - 1]) {
+            let mut rng = rand::thread_rng();
+            let msg = list[rng.gen::<usize>() % list.len()];
+            println!("substituting {} for {}", substitution, msg);
+            result = result.replace(substitution, msg); 
+            println!("intermediate sub {}", result);
+        }
+    }
+    result 
+}
+
 async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     if COMMAND_MESSAGES {
         match msg.data() {
@@ -272,17 +324,21 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                     if let Some(list) = state.lists.get(*name) {
                         let mut rng = rand::thread_rng();
                         let msg = list[rng.gen::<usize>() % list.len()];
-                        state.send_message(runner, msg).await; 
+                        println!("detected file {}", name);
+                        let mut result = substitute_random(state, msg);
+                        result = result.replace("{trigger}", token);
+                        state.send_message(runner, &result).await; 
                     }
                     break;
                 }
                 Some(MapValue::Value(value)) => {
-                    let msg = value.clone();
-                    state.send_message(runner, msg).await; 
+                    println!("detected value {}", value);
+                    let mut result = substitute_random(state, value);
+                    result = result.replace("{trigger}", token);
+                    state.send_message(runner, &result).await; 
                     break;
                 }
-                _ => {
-                }
+                _ => {}
             }
         }
         
