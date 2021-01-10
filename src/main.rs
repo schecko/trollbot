@@ -13,12 +13,10 @@ use std::time::{ Duration, Instant };
 use rand::Rng;
 use strum::*;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{ self, File };
 use std::io::prelude::*;
-use std::path::Path;
+use std::path::{ Path, PathBuf };
 
-const LANGUAGES_FILE: &str = "languages.list";
-const RESPONSES_FILE: &str = "language_responses.list";
 const TRIGGERS_FILE: &str = "triggers.map";
 
 fn load_list<'a>(contents: &'a str) -> Vec<&'a str> {
@@ -50,11 +48,6 @@ fn load_map<'a>(contents: &'a str) -> HashMap<&'a str, MapValue<'a>> {
     map 
 }
 
-const RESPONSES: &[&str] = &[
-    "Rust is bae.",
-    "You should have chosen Rust instead.",
-];
-
 const ADVICE: &[&str] = &[
     "Don't forget to commit, feeder.",
     "Bro you should take a break.",
@@ -77,8 +70,16 @@ async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<Asyn
     Ok(runner)
 }
 
-fn load_file(name: &str) -> anyhow::Result<String> {
-    let full_path = std::env::current_dir()?.join("data").join(name);
+fn data_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("data"))
+}
+
+fn load_file_rel(name: &str) -> anyhow::Result<String> { 
+    let full_path = data_dir()?.join(name);
+    load_file(&full_path)
+}
+
+fn load_file(full_path: &Path) -> anyhow::Result<String> {
     println!("path {:?}", full_path);
     let mut file = File::open(full_path)?;
     let mut contents = String::new();
@@ -93,16 +94,26 @@ async fn main() -> anyhow::Result<()> {
     let runner = connect(&user_config, &channel).await?;
     println!("starting main loop"); 
 
-    let triggers_content = load_file(TRIGGERS_FILE)?;
+    let triggers_content = load_file_rel(TRIGGERS_FILE)?;
     let triggers = load_map(&triggers_content); 
 
-    let languages_content = load_file(LANGUAGES_FILE)?;
-    let mut lists = HashMap::<String, Vec<&str>>::new();
-    lists.insert(String::from(Path::new(LANGUAGES_FILE).file_stem().unwrap().to_str().unwrap()), load_list(&languages_content));
-    let language_responses_content = load_file(RESPONSES_FILE)?;
-    lists.insert(String::from(Path::new(RESPONSES_FILE).file_stem().unwrap().to_str().unwrap()), load_list(&language_responses_content));
+    let dir = fs::read_dir(data_dir()?)?;
+    let mut contents = Vec::new();
+    let mut map = HashMap::new();
+    for file in dir.filter_map(|file| file.ok()) {
+        let path = file.path();
+        if let Some(ext) = path.extension() {
+            if ext != "list" { continue; }
+            let content = load_file(&path)?;
+            contents.push((String::from(path.file_stem().unwrap().to_str().unwrap()), content));
+        }
+    } 
+    let contents = contents;
+    for content in &contents {
+        map.insert(&content.0[..], load_list(&content.1)); 
+    }
 
-    let state = State::new(channel, triggers, lists);
+    let state = State::new(channel, triggers, map);
 
     main_loop(state, runner).await
 }
@@ -144,12 +155,12 @@ pub struct State<'a> {
     pub last_advice: Instant,
     pub next_advice: Duration,
     pub dedup_message: bool,
-    pub lists: HashMap<String, Vec<&'a str>>,
+    pub lists: HashMap<&'a str, Vec<&'a str>>,
     pub triggers: HashMap<&'a str, MapValue<'a>>,
 }
 
 impl<'a> State<'a> {
-    fn new(channel: String, triggers: HashMap<&'a str, MapValue<'a>>, lists: HashMap<String, Vec<&'a str>>) -> Self {
+    fn new(channel: String, triggers: HashMap<&'a str, MapValue<'a>>, lists: HashMap<&'a str, Vec<&'a str>>) -> Self {
         State {
             channel,
             mood: Mood::Normal,
@@ -266,7 +277,8 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                     break;
                 }
                 Some(MapValue::Value(value)) => {
-                    state.send_message(runner, value).await; 
+                    let msg = value.clone();
+                    state.send_message(runner, msg).await; 
                     break;
                 }
                 _ => {
