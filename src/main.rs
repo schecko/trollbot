@@ -12,56 +12,30 @@ use anyhow::Context as _;
 use std::time::{ Duration, Instant };
 use rand::Rng;
 use strum::*;
+use std::collections::{ HashSet, HashMap };
+use std::fs::File;
+use std::io::prelude::*;
 
-const TRIGGERS: &[&str] = &[
-    "abap",
-    "actionscript",
-    "ada",
-    "adenine",
-    "adga",
-    "advpl",
-    "agilent",
-    "agora",
-    "aimms",
-    "aldor",
-    "c",
-    "c#",
-    "c++",
-    "clojure",
-    "cobol",
-    "cpp",
-    "dart",
-    "delphi",
-    "erlang",
-    "fortran",
-    "go",
-    "groovy",
-    "haskell",
-    "jai",
-    "java",
-    "javascript",
-    "julia",
-    "kotlin",
-    "lisp",
-    "lua",
-    "matlab",
-    "objectivec",
-    "pascal",
-    "perl",
-    "php",
-    "powershell",
-    "prolog",
-    "python",
-    "ruby",
-    "rust",
-    "scala",
-    "scratch",
-    "sfortran",
-    "swift",
-    "typescript",
-    "vba",
-    "visual basic",
-];
+const LANGUAGES_FILE: &str = "data/languages.list";
+
+fn load_list<'a>(contents: &'a str) -> HashSet<&'a str> {
+    let mut set = HashSet::new();
+    for line in contents.lines() {
+        set.insert(line); 
+    } 
+    set
+}
+
+fn load_kv<'a>(contents: &'a str) -> HashMap<&'a str, &'a str> {
+    let mut map = HashMap::new();
+    for line in contents.lines() {
+        let mut split = line.split('='); 
+        if let (Some(key), Some(value)) = (split.next(), split.next()) {
+            map.insert(key, value); 
+        }
+    } 
+    map 
+}
 
 const RESPONSES: &[&str] = &[
     "Rust is bae.",
@@ -90,17 +64,31 @@ async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<Asyn
     Ok(runner)
 }
 
+fn load_file(name: &str) -> anyhow::Result<String> {
+    let full_path = std::env::current_dir()?.join(name);
+    let mut file = File::open(full_path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let (user_config, channel) = get_config()?;
 
     let runner = connect(&user_config, &channel).await?;
     println!("starting main loop");
-    let state = State::new(channel);
+
+
+    let languages_content = load_file(LANGUAGES_FILE)?;
+    let languages = load_list(&languages_content);
+
+
+    let state = State::new(channel, languages);
+
     main_loop(state, runner).await
 }
 
-// some helpers for the demo
 fn get_env_var(key: &str) -> anyhow::Result<String> {
     std::env::var(key).with_context(|| format!("please set `{}`", key))
 }
@@ -132,22 +120,24 @@ pub enum Mood {
     Backoff,
 }
 
-pub struct State {
+pub struct State<'languages> {
     pub channel: String,
     pub mood: Mood,
     pub last_advice: Instant,
     pub next_advice: Duration,
     pub dedup_message: bool,
+    pub languages: HashSet<&'languages str>,
 }
 
-impl State {
-    fn new(channel: String) -> Self {
+impl<'languages> State<'languages> {
+    fn new(channel: String, languages: HashSet<&'languages str>) -> Self {
         State {
             channel,
             mood: Mood::Normal,
             last_advice: Instant::now(),
             next_advice: PASSIVE_ADVICE_INTERVAL,
             dedup_message: false,
+            languages,
         }
     }
 
@@ -166,7 +156,7 @@ impl State {
     }
 }
 
-pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Result<()> {
+pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> anyhow::Result<()> {
     loop {
         match runner.next_message().await? {
             // this is the parsed message -- across all channels (and notifications from Twitch)
@@ -203,7 +193,7 @@ pub async fn main_loop(mut state: State, mut runner: AsyncRunner) -> anyhow::Res
     Ok(())
 }
 
-async fn parse_command(state: &mut State, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
+async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     if COMMAND_MESSAGES {
         match msg.data() {
             "fuckoff" | "fuck off" => {
@@ -244,7 +234,7 @@ async fn parse_command(state: &mut State, runner: &mut AsyncRunner, msg: &messag
         let lower_case = msg.data().to_lowercase();
         // todo ignore punctuation?
         for token in lower_case.split_whitespace() {
-            if TRIGGERS.iter().find(|&&trigger| trigger == token).is_some() {
+            if state.languages.contains(token) {
                 let mut rng = rand::thread_rng();
                 let msg = RESPONSES[rng.gen::<usize>() % RESPONSES.len()];
                 state.send_message(runner, msg).await;
@@ -256,7 +246,7 @@ async fn parse_command(state: &mut State, runner: &mut AsyncRunner, msg: &messag
     Ok(())
 }
 
-async fn handle_message(state: &mut State, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
+async fn handle_message(state: &mut State<'_>, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
     use messages::Commands::*;
     match msg {
         Privmsg(msg) => {
