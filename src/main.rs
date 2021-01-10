@@ -12,26 +12,39 @@ use anyhow::Context as _;
 use std::time::{ Duration, Instant };
 use rand::Rng;
 use strum::*;
-use std::collections::{ HashSet, HashMap };
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
+use std::path::Path;
 
-const LANGUAGES_FILE: &str = "data/languages.list";
+const LANGUAGES_FILE: &str = "languages.list";
+const RESPONSES_FILE: &str = "language_responses.list";
+const TRIGGERS_FILE: &str = "triggers.map";
 
-fn load_list<'a>(contents: &'a str) -> HashSet<&'a str> {
-    let mut set = HashSet::new();
+fn load_list<'a>(contents: &'a str) -> Vec<&'a str> {
+    let mut data = Vec::new();
     for line in contents.lines() {
-        set.insert(line); 
+        data.push(line); 
     } 
-    set
+    data
 }
 
-fn load_kv<'a>(contents: &'a str) -> HashMap<&'a str, &'a str> {
+#[derive(Debug)]
+pub enum MapValue<'a> {
+    FileName(&'a str),
+    Value(&'a str),
+}
+
+fn load_map<'a>(contents: &'a str) -> HashMap<&'a str, MapValue<'a>> {
     let mut map = HashMap::new();
     for line in contents.lines() {
         let mut split = line.split('='); 
         if let (Some(key), Some(value)) = (split.next(), split.next()) {
-            map.insert(key, value); 
+            if let Some('[') = value.chars().next() {
+                map.insert(key, MapValue::FileName(&value[1..])); 
+            } else {
+                map.insert(key, MapValue::Value(value)); 
+            }
         }
     } 
     map 
@@ -65,7 +78,8 @@ async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<Asyn
 }
 
 fn load_file(name: &str) -> anyhow::Result<String> {
-    let full_path = std::env::current_dir()?.join(name);
+    let full_path = std::env::current_dir()?.join("data").join(name);
+    println!("path {:?}", full_path);
     let mut file = File::open(full_path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
@@ -77,14 +91,18 @@ async fn main() -> anyhow::Result<()> {
     let (user_config, channel) = get_config()?;
 
     let runner = connect(&user_config, &channel).await?;
-    println!("starting main loop");
+    println!("starting main loop"); 
 
+    let triggers_content = load_file(TRIGGERS_FILE)?;
+    let triggers = load_map(&triggers_content); 
 
     let languages_content = load_file(LANGUAGES_FILE)?;
-    let languages = load_list(&languages_content);
+    let mut lists = HashMap::<String, Vec<&str>>::new();
+    lists.insert(String::from(Path::new(LANGUAGES_FILE).file_stem().unwrap().to_str().unwrap()), load_list(&languages_content));
+    let language_responses_content = load_file(RESPONSES_FILE)?;
+    lists.insert(String::from(Path::new(RESPONSES_FILE).file_stem().unwrap().to_str().unwrap()), load_list(&language_responses_content));
 
-
-    let state = State::new(channel, languages);
+    let state = State::new(channel, triggers, lists);
 
     main_loop(state, runner).await
 }
@@ -120,24 +138,26 @@ pub enum Mood {
     Backoff,
 }
 
-pub struct State<'languages> {
+pub struct State<'a> {
     pub channel: String,
     pub mood: Mood,
     pub last_advice: Instant,
     pub next_advice: Duration,
     pub dedup_message: bool,
-    pub languages: HashSet<&'languages str>,
+    pub lists: HashMap<String, Vec<&'a str>>,
+    pub triggers: HashMap<&'a str, MapValue<'a>>,
 }
 
-impl<'languages> State<'languages> {
-    fn new(channel: String, languages: HashSet<&'languages str>) -> Self {
+impl<'a> State<'a> {
+    fn new(channel: String, triggers: HashMap<&'a str, MapValue<'a>>, lists: HashMap<String, Vec<&'a str>>) -> Self {
         State {
             channel,
             mood: Mood::Normal,
             last_advice: Instant::now(),
             next_advice: PASSIVE_ADVICE_INTERVAL,
             dedup_message: false,
-            languages,
+            lists,
+            triggers,
         }
     }
 
@@ -230,17 +250,30 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
         }
     }
 
-    if TRIGGER_MESSAGES {
+    if TRIGGER_MESSAGES { 
+        println!("triggers {:?}", state.triggers);
+        println!("lists {:?}", state.lists);
         let lower_case = msg.data().to_lowercase();
         // todo ignore punctuation?
         for token in lower_case.split_whitespace() {
-            if state.languages.contains(token) {
-                let mut rng = rand::thread_rng();
-                let msg = RESPONSES[rng.gen::<usize>() % RESPONSES.len()];
-                state.send_message(runner, msg).await;
-                break;
-            } 
+            match state.triggers.get(token) {
+                Some(MapValue::FileName(name)) => {
+                    if let Some(list) = state.lists.get(*name) {
+                        let mut rng = rand::thread_rng();
+                        let msg = list[rng.gen::<usize>() % list.len()];
+                        state.send_message(runner, msg).await; 
+                    }
+                    break;
+                }
+                Some(MapValue::Value(value)) => {
+                    state.send_message(runner, value).await; 
+                    break;
+                }
+                _ => {
+                }
+            }
         }
+        
     }
 
     Ok(())
