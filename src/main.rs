@@ -1,3 +1,7 @@
+// TODO
+// - your momma jokes
+// - chuck norris jokes
+// - general jokes
 extern crate tokio;
 extern crate anyhow;
 extern crate rand;
