@@ -27,6 +27,9 @@ fn load_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
     for line in contents.lines() {
         if line.len() == 0 { continue; }
+        if let Some('-') = line.chars().next() {
+            continue;
+        }
         data.push(line); 
     } 
     data
@@ -54,6 +57,9 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
         if let (Some(meta_key), Some(value)) = (split.next(), split.next()) {
             if meta_key.len() == 0 { continue; }
             if value.len() == 0 { continue; }
+            if let Some('-') = meta_key.chars().next() {
+                continue;
+            }
 
             let single = vec![meta_key];
             let keys = if let Some('[') = meta_key.chars().next() {
@@ -96,12 +102,6 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
     } 
     (multi_triggers, map)
 }
-
-const ADVICE: &[&str] = &[
-    "Don't forget to commit, feeder.",
-    "Bro you should take a break.",
-    "Eat tendies frequently.",
-];
 
 const PASSIVE_MESSAGES: bool = true;
 const TRIGGER_MESSAGES: bool = true;
@@ -248,10 +248,25 @@ impl<'a> State<'a> {
     }
 }
 
+async fn send_passive_advice(state: &mut State<'_>, runner: &mut AsyncRunner) {
+    let passive = state.lists.get("passive_advice").unwrap();
+    let mut rng = rand::thread_rng();
+    let msg = passive[rng.gen::<usize>() % passive.len()]; 
+    let result = substitute_random(&state, msg); 
+    state.send_message(runner, &result).await 
+}
+
+async fn send_passive_question(state: &mut State<'_>, runner: &mut AsyncRunner) {
+    let passive = state.lists.get("questions").unwrap();
+    let mut rng = rand::thread_rng();
+    let msg = passive[rng.gen::<usize>() % passive.len()]; 
+    let result = substitute_random(&state, msg); 
+    state.send_message(runner, &result).await 
+}
+
 pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> anyhow::Result<()> {
     loop {
         match runner.next_message().await? {
-            // this is the parsed message -- across all channels (and notifications from Twitch)
             Status::Message(msg) => {
                 handle_message(&mut state, &mut runner, msg).await;
             }
@@ -268,11 +283,10 @@ pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> anyhow:
         if state.last_advice + state.next_advice < Instant::now() {
             match state.mood {
                 Mood::Normal => {
-                    let mut rng = rand::thread_rng();
-                    let msg = ADVICE[rng.gen::<usize>() % ADVICE.len()];
-                    if PASSIVE_MESSAGES && !state.dedup_message {
-                        state.send_message(&mut runner, msg).await
+                    if PASSIVE_MESSAGES && !state.dedup_message { 
+                        send_passive_advice(&mut state, &mut runner).await;
                     }
+
                 }
                 Mood::Backoff => {
                     state.set_mood(Mood::Normal);
@@ -334,22 +348,29 @@ fn substitute_random(state: &State<'_>, message: &str) -> String {
     result 
 }
 
-fn make_response(state: &State<'_>, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
-    match map_value{
+fn subst_fixed(_state: &State<'_>, user: &str, trigger: &str, message: &str) -> String { 
+    let mut result = message.replace("{trigger}", trigger);
+    result = result.replace("{user}", user);
+    return result;
+
+}
+
+fn make_response(state: &State<'_>, user: &str, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
+    match map_value {
         MapValue::FileName(name) => {
             if let Some(list) = state.lists.get(*name) {
                 let mut rng = rand::thread_rng();
                 let msg = list[rng.gen::<usize>() % list.len()];
                 println!("detected file {}", name);
                 let mut result = substitute_random(state, msg);
-                result = result.replace("{trigger}", trigger);
+                result = subst_fixed(state, user, trigger, &result);
                 return Some(result);
             }
         }
         MapValue::Value(value) => {
             println!("detected value {}", value);
             let mut result = substitute_random(state, value);
-            result = result.replace("{trigger}", trigger);
+            result = subst_fixed(state, user, trigger, &result);
             return Some(result);
         }
     } 
@@ -389,6 +410,14 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                 state.send_message(runner, "https://www.youtube.com/watch?v=dQw4w9WgXcQ").await;
                 return Ok(());
             }
+            "!random" => { 
+                send_passive_advice(state, runner).await;
+                return Ok(());
+            }
+            "!question" => { 
+                send_passive_question(state, runner).await;
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -402,7 +431,7 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
         for token in lower_case.split_whitespace() {
             match state.triggers.get(token) {
                 Some(value) => {
-                    if let Some(response) = make_response(state, token, value) {
+                    if let Some(response) = make_response(state, msg.name(), token, value) {
                         state.send_message(runner, &response).await; 
                     }
                 }
@@ -425,12 +454,13 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                 if lower_case.contains(trigger) {
                     found = true; 
                 } else {
+                    found = false;
                     break 'inner;
                 }
             }
 
             if found { 
-                opt_response = make_response(state, multi_trigger.triggers[0], &multi_trigger.value);
+                opt_response = make_response(state, msg.name(), &multi_trigger.triggers.join(" "), &multi_trigger.value);
             }
         }
         if let Some(response) = opt_response {
