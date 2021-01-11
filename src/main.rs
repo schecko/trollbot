@@ -1,3 +1,5 @@
+// TODO 
+// - per trigger cooldowns
 extern crate tokio;
 extern crate anyhow;
 extern crate rand;
@@ -12,7 +14,7 @@ use anyhow::Context as _;
 use std::time::{ Duration, Instant };
 use rand::Rng;
 use strum::*;
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
 use std::fs::{ self, File };
 use std::io::prelude::*;
 use std::path::{ Path, PathBuf };
@@ -208,6 +210,7 @@ pub struct State<'a> {
     pub multi_triggers: Vec<MultiTrigger<'a>>,
     pub next_advice: Duration,
     pub triggers: HashMap<&'a str, MapValue<'a>>,
+    pub ignores: HashSet<String>,
 }
 
 impl<'a> State<'a> {
@@ -226,6 +229,7 @@ impl<'a> State<'a> {
             multi_triggers,
             next_advice: PASSIVE_ADVICE_INTERVAL,
             triggers,
+            ignores: HashSet::new(),
         }
     }
 
@@ -416,11 +420,25 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                 send_passive_question(state, runner).await;
                 return Ok(());
             }
+            "!ignoreme" => { 
+                let raw_response = "ignoring {user}";
+                let result = subst_fixed(state, msg.name(), "", raw_response);
+                state.ignores.insert(msg.name().to_string());
+                state.send_message(runner, &result).await;
+                return Ok(());
+            }
+            "!noticeme" => { 
+                let raw_response = "senpai is noticing you {user}";
+                let result = subst_fixed(state, msg.name(), "", raw_response);
+                state.ignores.remove(msg.name());
+                state.send_message(runner, &result).await;
+                return Ok(());
+            }
             _ => {}
         }
     }
 
-    if TRIGGER_MESSAGES && state.mood == Mood::Normal { 
+    if TRIGGER_MESSAGES && state.mood == Mood::Normal && !state.ignores.contains(msg.name()) { 
         println!("triggers {:#?}", state.triggers);
         println!("lists {:#?}", state.lists);
         println!("multi triggers {:#?}", state.multi_triggers);
