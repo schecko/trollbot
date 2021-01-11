@@ -191,7 +191,7 @@ pub fn get_config() -> anyhow::Result<(twitchchat::UserConfig, String)> {
 const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
 const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
 
-#[derive(Display)]
+#[derive(Display, PartialEq, Eq)]
 pub enum Mood {
     #[strum(to_string = "normal")]
     Normal,
@@ -376,18 +376,20 @@ fn make_response(state: &State<'_>, user: &str, trigger: &str, map_value: &MapVa
 async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     if COMMAND_MESSAGES {
         match msg.data() {
-            "fuckoff" | "fuck off" => {
-                state.send_message(runner, "No, you fuck off.").await;
-                return Ok(());
-            }
             "!fuckoff" => {
-                state.send_message(runner, "Fine, I'll fuck off.").await;
+                state.send_message(runner, "fine, i'll fuck off").await;
                 state.next_advice = BACKOFF_ADVICE_INTERVAL;
                 state.set_mood(Mood::Backoff);
                 return Ok(());
             }
+            "!comeback" => {
+                state.send_message(runner, "i knew you would miss me").await;
+                state.next_advice = PASSIVE_ADVICE_INTERVAL;
+                state.set_mood(Mood::Normal);
+                return Ok(());
+            }
             "!feed" => {
-                state.send_message(runner, "Mmm I love tendies.").await;
+                state.send_message(runner, "Mmm i love tendies").await;
                 return Ok(());
             }
             "!bot" => {
@@ -395,11 +397,11 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
                 return Ok(());
             }
             "!mood" => {
-                state.send_message(runner, &format!("Mr/Ms streamer is feeling {}.", state.mood)).await;
+                state.send_message(runner, &format!("Mr/Ms streamer is feeling {}", state.mood)).await;
                 return Ok(());
             }
             "!purpose" => {
-                state.send_message(runner, "My purpose in life is to troll @SomewhatAccurate and his viewers.").await;
+                state.send_message(runner, "my purpose in life is to troll @SomewhatAccurate and his viewers.").await;
                 return Ok(());
             }
             "!about" => {
@@ -418,7 +420,7 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
         }
     }
 
-    if TRIGGER_MESSAGES { 
+    if TRIGGER_MESSAGES && state.mood == Mood::Normal { 
         println!("triggers {:#?}", state.triggers);
         println!("lists {:#?}", state.lists);
         println!("multi triggers {:#?}", state.multi_triggers);

@@ -27,3 +27,5 @@ should work game=get back to work, {insults}
 do i work game=get back to work, {insults}
 what should do=learn {languages}
 im bored=too bad
+fuck off=no, you {go_away}
+fuckoff=no, you {go_away}
