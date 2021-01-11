@@ -439,9 +439,6 @@ async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &me
     }
 
     if TRIGGER_MESSAGES && state.mood == Mood::Normal && !state.ignores.contains(msg.name()) { 
-        println!("triggers {:#?}", state.triggers);
-        println!("lists {:#?}", state.lists);
-        println!("multi triggers {:#?}", state.multi_triggers);
         let lower_case = msg.data().to_lowercase();
         // todo ignore punctuation?
         for token in lower_case.split_whitespace() {
