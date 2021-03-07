@@ -4,6 +4,7 @@ extern crate tokio;
 extern crate anyhow;
 extern crate rand;
 extern crate strum;
+extern crate itertools;
 
 use twitchchat::{
     commands, connector, messages,
@@ -20,9 +21,13 @@ use std::io::prelude::*;
 use std::path::{ Path, PathBuf };
 use std::error::Error;
 use std::borrow::Cow;
+use std::borrow::Borrow;
+use itertools::Itertools;
 
 const TRIGGERS_FILE: &str = "triggers.map";
 const CONFIG_CHANNELS: &str = "channels.list";
+const CONFIG_COMMANDS: &str = "commands.map";
+const COMMANDS_TEXT_FILE: &str = "commands_text.map";
 
 fn parse_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
@@ -177,12 +182,22 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
     let triggers_content = load_file_rel(TRIGGERS_FILE)?;
     let (multi_triggers, triggers) = load_map(&triggers_content, &map); 
 
+    // map a command to some text the user sees
+    let command_text_content = load_file_rel(COMMANDS_TEXT_FILE)?;
+    let (_, commands_text) = load_map(&command_text_content, &map); 
+
+    // map a command to a code operation
+    let command_content = load_config_file(CONFIG_COMMANDS)?;
+    let (_, commands) = load_map(&command_content, &map); 
+
     println!("lists {:#?}", map);
     println!("multi triggers {:#?}", multi_triggers);
     println!("triggers {:#?}", triggers);
+    println!("commands {:#?}", commands);
+    println!("commands text {:#?}", commands_text);
 
     let state = State::new(channels);
-    let lm = ListsMaps::new( map, multi_triggers, triggers);
+    let lm = ListsMaps::new( commands, commands_text, map, multi_triggers, triggers);
 
     main_loop(state, &lm, runner).await 
 }
@@ -255,6 +270,8 @@ impl<'a> ChannelState<'a> {
 }
 
 pub struct ListsMaps<'a> {
+    pub commands: HashMap<Cow<'a, str>, MapValue<'a>>,
+    pub command_text: HashMap<Cow<'a, str>, MapValue<'a>>,
     pub lists: HashMap<&'a str, Vec<&'a str>>,
     pub multi_triggers: Vec<MultiTrigger<'a>>,
     pub triggers: HashMap<Cow<'a, str>, MapValue<'a>>,
@@ -262,11 +279,15 @@ pub struct ListsMaps<'a> {
 
 impl<'a> ListsMaps<'a> {
     fn new(
+        commands: HashMap<Cow<'a, str>, MapValue<'a>>,
+        command_text: HashMap<Cow<'a, str>, MapValue<'a>>,
         lists: HashMap<&'a str, Vec<&'a str>>,
         multi_triggers: Vec<MultiTrigger<'a>>, 
         triggers: HashMap<Cow<'a, str>, MapValue<'a>>, 
     ) -> Self {
         ListsMaps {
+            commands,
+            command_text,
             lists,
             multi_triggers,
             triggers,
@@ -518,66 +539,59 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
         } else {
             println!("parse_command: failed to find channel {}", channel );
             return Err("parse command failed to find channel".into());
-        };
+        }; 
 
-        match msg.data() {
-            "!fuckoff" => {
-                cstate.send_message(runner, "fine, i'll fuck off").await;
-                cstate.next_advice = BACKOFF_ADVICE_INTERVAL;
-                state.set_mood(channel, Mood::Backoff);
-                return Ok(());
+        let mut was_command = false;
+        if let Some(MapValue::Value(command_text)) = lm.command_text.get(msg.data()) {
+            let result = subst_context(cstate, msg.name(), msg.data(), Cow::Borrowed(command_text));
+
+            cstate.send_message(runner, &result).await;
+            was_command = true;
+        }
+
+        if let Some(MapValue::Value(command)) = lm.commands.get(msg.data()) {
+            match *command {
+                "COMMANDS" => {
+                    let keys: HashSet<&str> = lm.command_text.keys().chain( lm.commands.keys() ).map(|k| k.borrow()).collect();
+                    let msg: String = keys.iter().join(", ");
+                    cstate.send_message(runner, &msg).await; 
+                    return Ok(());
+                }
+                "LEAVE" => {
+                    cstate.next_advice = BACKOFF_ADVICE_INTERVAL;
+                    state.set_mood(channel, Mood::Backoff);
+                    return Ok(());
+                }
+                "JOIN" => {
+                    cstate.next_advice = PASSIVE_ADVICE_INTERVAL;
+                    state.set_mood(channel, Mood::Normal);
+                    return Ok(());
+                }
+                "RANDOM_STATEMENT" => { 
+                    send_passive_advice(cstate, lm, runner).await;
+                    return Ok(());
+                }
+                "RANDOM_QUESTION" => { 
+                    send_passive_question(cstate, lm, runner).await;
+                    return Ok(());
+                }
+                "IGNORE_ME" => { 
+                    state.ignores.insert(msg.name().to_string());
+                    return Ok(());
+                }
+                "NOTICE_ME" => { 
+                    state.ignores.remove(msg.name());
+                    return Ok(());
+                }
+                _ => {}
             }
-            "!comeback" => {
-                cstate.send_message(runner, "i knew you would miss me").await;
-                cstate.next_advice = PASSIVE_ADVICE_INTERVAL;
-                state.set_mood(channel, Mood::Normal);
-                return Ok(());
-            }
-            "!feed" => {
-                cstate.send_message(runner, "Mmm i love tendies").await;
-                return Ok(());
-            }
-            "!bot" => {
-                cstate.send_message(runner, "github.com/schecko/cynobot").await;
-                return Ok(());
-            }
-            "!mood" => {
-                cstate.send_message(runner, &format!("Mr/Ms streamer is feeling {}", cstate.mood)).await;
-                return Ok(());
-            }
-            "!purpose" => {
-                cstate.send_message(runner, "my purpose in life is to troll @SomewhatAccurate and his viewers.").await;
-                return Ok(());
-            }
-            "!about" => {
-                cstate.send_message(runner, "https://www.youtube.com/watch?v=dQw4w9WgXcQ").await;
-                return Ok(());
-            }
-            "!random" => { 
-                send_passive_advice(cstate, lm, runner).await;
-                return Ok(());
-            }
-            "!question" => { 
-                send_passive_question(cstate, lm, runner).await;
-                return Ok(());
-            }
-            "!ignoreme" => { 
-                let raw_response = "ignoring {user}";
-                let result = subst_context(cstate, msg.name(), "", Cow::Borrowed(raw_response));
-                state.ignores.insert(msg.name().to_string());
-                cstate.send_message(runner, &result).await;
-                return Ok(());
-            }
-            "!noticeme" => { 
-                let raw_response = "senpai is noticing you {user}";
-                let result = subst_context(cstate, msg.name(), "", Cow::Borrowed(raw_response));
-                state.ignores.remove(msg.name());
-                cstate.send_message(runner, &result).await;
-                return Ok(());
-            }
-            _ => {}
+        }
+
+        if was_command {
+            return Ok(());
         }
     }
+
 
     if TRIGGER_MESSAGES {
         handle_triggers( state, lm, runner, msg ).await?;
