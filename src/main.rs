@@ -18,6 +18,7 @@ use std::collections::{ HashMap, HashSet };
 use std::fs::{ self, File };
 use std::io::prelude::*;
 use std::path::{ Path, PathBuf };
+use std::error::Error;
 
 const TRIGGERS_FILE: &str = "triggers.map";
 
@@ -134,8 +135,7 @@ fn load_file(full_path: &Path) -> anyhow::Result<String> {
     Ok(contents)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn connect_run() -> Result<(), Box<dyn Error>> {
     let (user_config, channel) = get_config()?;
 
     let runner = connect(&user_config, &channel).await?;
@@ -167,7 +167,19 @@ async fn main() -> anyhow::Result<()> {
 
     let state = State::new(channel, triggers, multi_triggers, map);
 
-    main_loop(state, runner).await
+    main_loop(state, runner).await 
+}
+
+#[tokio::main]
+async fn main() { 
+    loop {
+        match connect_run().await {
+            Ok(_) => {}
+            Err(e) => {
+                println!("error in main {:?}", e);
+            }
+        }
+    }
 }
 
 fn get_env_var(key: &str) -> anyhow::Result<String> {
@@ -264,7 +276,7 @@ async fn send_passive_question(state: &mut State<'_>, runner: &mut AsyncRunner) 
     state.send_message(runner, &result).await 
 }
 
-pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> anyhow::Result<()> {
+pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
     loop {
         match runner.next_message().await? {
             Status::Message(msg) => {
