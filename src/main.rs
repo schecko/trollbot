@@ -19,6 +19,7 @@ use std::fs::{ self, File };
 use std::io::prelude::*;
 use std::path::{ Path, PathBuf };
 use std::error::Error;
+use std::borrow::Cow;
 
 const TRIGGERS_FILE: &str = "triggers.map";
 const CONFIG_CHANNELS: &str = "channels.list";
@@ -61,6 +62,8 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
                 continue;
             }
 
+            // the starting character can be a meta key, if the meta_key is a forward square
+            // bracket, then the key is pointing to a list file. treat each entry as a key
             let single = vec![meta_key];
             let keys = if let Some('[') = meta_key.chars().next() {
                 lists.get(&meta_key[1..]).unwrap()
@@ -69,8 +72,6 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
             };
 
             'key_loop: for key in keys { 
-                if key.contains('{') { continue 'key_loop; }
-
                 let map_value = if let Some('[') = value.chars().next() {
                     MapValue::FileName(&value[1..]) 
                 } else {
@@ -95,6 +96,7 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
                         value: map_value,
                     }); 
                 } else {
+                    if key.contains('{') { continue 'key_loop; }
                     map.insert(*key, map_value);
                 }
             }
@@ -175,9 +177,9 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
     let triggers_content = load_file_rel(TRIGGERS_FILE)?;
     let (multi_triggers, triggers) = load_map(&triggers_content, &map); 
 
-    //println!("lists {:#?}", map);
-    //println!("multi triggers {:#?}", multi_triggers);
-    //println!("triggers {:#?}", triggers);
+    println!("lists {:#?}", map);
+    println!("multi triggers {:#?}", multi_triggers);
+    println!("triggers {:#?}", triggers);
 
     let state = State::new(channels);
     let lm = ListsMaps::new( triggers, multi_triggers, map);
@@ -394,33 +396,40 @@ impl<'a> Iterator for SubLocations<'a> {
     }
 }
 
-fn substitute_random(lm: &ListsMaps<'_>, message: &str) -> String { 
-    println!("substituting {}", message);
-    let mut result = String::from(message);
-    for substitution in SubLocations::new(message) {
-        println!("found substitution location {}", substitution);
-        if substitution.len() < 3 { continue; } 
-        if let Some(list) = lm.lists.get(&substitution[1..substitution.len() - 1]) {
-            let mut rng = rand::thread_rng();
-            let msg = list[rng.gen::<usize>() % list.len()];
-            println!("substituting {} for {}", substitution, msg);
-            result = result.replace(substitution, msg); 
-            println!("intermediate sub {}", result);
+fn substitute_random<'a>(lm: &ListsMaps<'a>, message: &'a str) -> Cow<'a, str> { 
+    if message.contains("{") {
+        println!("substituting {}", message);
+        let mut result = String::from(message);
+        for substitution in SubLocations::new(message) {
+            println!("found substitution location {}", substitution);
+            if substitution.len() < 3 { continue; } 
+            if let Some(list) = lm.lists.get(&substitution[1..substitution.len() - 1]) {
+                let mut rng = rand::thread_rng();
+                let msg = list[rng.gen::<usize>() % list.len()];
+                println!("substituting {} for {}", substitution, msg);
+                result = result.replace(substitution, msg); 
+                println!("intermediate sub {}", result);
+            }
         }
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(message)
     }
-    result 
 }
 
-fn subst_global(state: &ChannelState<'_>, user: &str, trigger: &str, message: &str) -> String { 
-    let mut result = message.replace("{trigger}", trigger);
-    result = result.replace("{user}", user);
-    result = result.replace("{channel}", state.channel_name);
-    result = result.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
-    return result;
-
+fn subst_global<'a>(state: &ChannelState<'_>, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
+    if message.contains("{") {
+        let mut result = message.replace("{trigger}", trigger);
+        result = result.replace("{user}", user);
+        result = result.replace("{channel}", state.channel_name);
+        result = result.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
+        return Cow::Owned(result);
+    } else {
+        return message;
+    } 
 }
 
-fn make_response(state: &ChannelState<'_>, lm: &ListsMaps<'_>, user: &str, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
+fn make_response<'a>(state: &ChannelState<'_>, lm: &ListsMaps<'a>, user: &str, trigger: &str, map_value: &MapValue<'a>) -> Option<Cow<'a, str>> {
     match map_value {
         MapValue::FileName(name) => {
             if let Some(list) = lm.lists.get(*name) {
@@ -428,14 +437,14 @@ fn make_response(state: &ChannelState<'_>, lm: &ListsMaps<'_>, user: &str, trigg
                 let msg = list[rng.gen::<usize>() % list.len()];
                 println!("detected file {}", name);
                 let mut result = substitute_random(lm, msg);
-                result = subst_global(state, user, trigger, &result);
+                result = subst_global(state, user, trigger, result);
                 return Some(result);
             }
         }
         MapValue::Value(value) => {
             println!("detected value {}", value);
             let mut result = substitute_random(lm, value);
-            result = subst_global(state, user, trigger, &result);
+            result = subst_global(state, user, trigger, result);
             return Some(result);
         }
     } 
@@ -469,9 +478,10 @@ async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut
                         } else {
                             continue 'outer; 
                         }
-                    } 
+                    }
 
-                    if lower_case.contains(trigger) {
+                    let trigger_subst = subst_global(cstate, msg.name(), "", Cow::Borrowed(trigger)); 
+                    if lower_case.contains(&*trigger_subst) {
                         found = true; 
                     } else {
                         found = false;
@@ -545,14 +555,14 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
             }
             "!ignoreme" => { 
                 let raw_response = "ignoring {user}";
-                let result = subst_global(cstate, msg.name(), "", raw_response);
+                let result = subst_global(cstate, msg.name(), "", Cow::Borrowed(raw_response));
                 state.ignores.insert(msg.name().to_string());
                 cstate.send_message(runner, &result).await;
                 return Ok(());
             }
             "!noticeme" => { 
                 let raw_response = "senpai is noticing you {user}";
-                let result = subst_global(cstate, msg.name(), "", raw_response);
+                let result = subst_global(cstate, msg.name(), "", Cow::Borrowed(raw_response));
                 state.ignores.remove(msg.name());
                 cstate.send_message(runner, &result).await;
                 return Ok(());
