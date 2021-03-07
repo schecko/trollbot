@@ -21,8 +21,9 @@ use std::path::{ Path, PathBuf };
 use std::error::Error;
 
 const TRIGGERS_FILE: &str = "triggers.map";
+const CONFIG_CHANNELS: &str = "channels.list";
 
-fn load_list<'a>(contents: &'a str) -> Vec<&'a str> {
+fn parse_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
     for line in contents.lines() {
         if line.len() == 0 { continue; }
@@ -106,14 +107,17 @@ const PASSIVE_MESSAGES: bool = true;
 const TRIGGER_MESSAGES: bool = true;
 const COMMAND_MESSAGES: bool = true;
 
-async fn connect(user_config: &UserConfig, channel: &str) -> anyhow::Result<AsyncRunner> {
+async fn connect(user_config: &UserConfig, channels: &Vec<&str>) -> anyhow::Result<AsyncRunner> {
     let connector = connector::tokio::ConnectorRustTls::twitch()?;
 
     println!("Connecting...");
     let mut runner = AsyncRunner::connect(connector, user_config).await?;
-    println!("..Connected, attempting to join channel '{}'", channel);
-    let _ = runner.join(&channel).await?;
-    println!("joined '{}'!", channel);
+    println!("..Connected");
+
+    for channel in channels {
+        let _ = runner.join(&channel).await?;
+        println!("joined '{}'!", channel);
+    }
 
     Ok(runner)
 }
@@ -127,6 +131,15 @@ fn load_file_rel(name: &str) -> anyhow::Result<String> {
     load_file(&full_path)
 }
 
+fn config_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("config"))
+}
+
+fn load_config_file(name: &str) -> anyhow::Result<String> { 
+    let full_path = config_dir()?.join(name);
+    load_file(&full_path)
+}
+
 fn load_file(full_path: &Path) -> anyhow::Result<String> {
     println!("path {:?}", full_path);
     let mut file = File::open(full_path)?;
@@ -136,9 +149,10 @@ fn load_file(full_path: &Path) -> anyhow::Result<String> {
 }
 
 async fn connect_run() -> Result<(), Box<dyn Error>> {
-    let (user_config, channel) = get_config()?;
+    let channels_content = load_config_file(CONFIG_CHANNELS)?;
+    let (user_config, channels) = get_config(&channels_content)?;
 
-    let runner = connect(&user_config, &channel).await?;
+    let runner = connect(&user_config, &channels).await?;
     println!("starting main loop"); 
 
     let dir = fs::read_dir(data_dir()?)?;
@@ -155,19 +169,20 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
 
     let contents = contents;
     for content in &contents {
-        map.insert(&content.0[..], load_list(&content.1)); 
+        map.insert(&content.0[..], parse_list(&content.1)); 
     }
 
     let triggers_content = load_file_rel(TRIGGERS_FILE)?;
     let (multi_triggers, triggers) = load_map(&triggers_content, &map); 
 
-    println!("lists {:#?}", map);
-    println!("multi triggers {:#?}", multi_triggers);
-    println!("triggers {:#?}", triggers);
+    //println!("lists {:#?}", map);
+    //println!("multi triggers {:#?}", multi_triggers);
+    //println!("triggers {:#?}", triggers);
 
-    let state = State::new(channel, triggers, multi_triggers, map);
+    let state = State::new(channels);
+    let lm = ListsMaps::new( triggers, multi_triggers, map);
 
-    main_loop(state, runner).await 
+    main_loop(state, &lm, runner).await 
 }
 
 #[tokio::main]
@@ -186,10 +201,11 @@ fn get_env_var(key: &str) -> anyhow::Result<String> {
     std::env::var(key).with_context(|| format!("please set `{}`", key))
 }
 
-pub fn get_config() -> anyhow::Result<(twitchchat::UserConfig, String)> {
+pub fn get_config<'a>(channel_content: &'a str) -> Result<(twitchchat::UserConfig, Vec<&'a str>), Box<dyn Error>> {
     let name = get_env_var("TWITCH_NAME")?;
     let token = get_env_var("TWITCH_TOKEN")?;
-    let channel = get_env_var("TWITCH_CHANNEL")?;
+    let channels = parse_list(channel_content);
+
 
     let config = UserConfig::builder()
         // twitch account name
@@ -199,7 +215,7 @@ pub fn get_config() -> anyhow::Result<(twitchchat::UserConfig, String)> {
         .enable_all_capabilities()
         .build()?;
 
-    Ok((config, channel))
+    Ok((config, channels))
 }
 
 const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
@@ -213,46 +229,22 @@ pub enum Mood {
     Backoff,
 }
 
-pub struct State<'a> {
-    pub channel: String,
-    pub dedup_message: bool,
-    pub last_advice: Instant,
-    pub lists: HashMap<&'a str, Vec<&'a str>>,
+pub struct ChannelState<'a> {
     pub mood: Mood,
-    pub multi_triggers: Vec<MultiTrigger<'a>>,
+    pub last_advice: Instant,
     pub next_advice: Duration,
-    pub triggers: HashMap<&'a str, MapValue<'a>>,
-    pub ignores: HashSet<String>,
+    pub dedup_message: bool, 
+    pub channel_name: &'a str,
 }
 
-impl<'a> State<'a> {
-    fn new(
-        channel: String, 
-        triggers: HashMap<&'a str, MapValue<'a>>, 
-        multi_triggers: Vec<MultiTrigger<'a>>, 
-        lists: HashMap<&'a str, Vec<&'a str>>
-    ) -> Self {
-        State {
-            channel,
-            dedup_message: false,
-            last_advice: Instant::now(),
-            lists,
-            mood: Mood::Normal,
-            multi_triggers,
-            next_advice: PASSIVE_ADVICE_INTERVAL,
-            triggers,
-            ignores: HashSet::new(),
-        }
-    }
-
-    fn set_mood(&mut self, mood: Mood)
-    {
+impl<'a> ChannelState<'a> { 
+    fn set_mood(&mut self, mood: Mood) {
         self.mood = mood;
     }
 
     async fn send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
         let mut writer = runner.writer();
-        let cmd = commands::privmsg(&self.channel, msg);
+        let cmd = commands::privmsg(&self.channel_name, msg);
         writer.encode(cmd).await.unwrap();
 
         self.dedup_message = true;
@@ -260,27 +252,84 @@ impl<'a> State<'a> {
     }
 }
 
-async fn send_passive_advice(state: &mut State<'_>, runner: &mut AsyncRunner) {
-    let passive = state.lists.get("passive_advice").unwrap();
+pub struct ListsMaps<'a> {
+    pub lists: HashMap<&'a str, Vec<&'a str>>,
+    pub multi_triggers: Vec<MultiTrigger<'a>>,
+    pub triggers: HashMap<&'a str, MapValue<'a>>,
+}
+
+impl<'a> ListsMaps<'a> {
+    fn new(
+        triggers: HashMap<&'a str, MapValue<'a>>, 
+        multi_triggers: Vec<MultiTrigger<'a>>, 
+        lists: HashMap<&'a str, Vec<&'a str>>
+    ) -> Self {
+        ListsMaps {
+            lists,
+            multi_triggers,
+            triggers,
+        } 
+    }
+
+}
+
+pub struct State<'a> {
+    pub channels: HashMap<&'a str, ChannelState<'a>>,
+    pub ignores: HashSet<String>,
+}
+
+impl<'a> State<'a> {
+    fn new(
+        channels: Vec<&'a str>, 
+    ) -> Self {
+        let chans = channels
+                .iter()
+                .map(|&chan| { 
+                (
+                    chan, 
+                    ChannelState { 
+                        mood: Mood::Normal, 
+                        last_advice: Instant::now(), 
+                        next_advice: PASSIVE_ADVICE_INTERVAL, 
+                        dedup_message: false,
+                        channel_name: chan,
+                    } 
+                ) } )
+                .collect();
+        State {
+            channels: chans,
+            ignores: HashSet::new(),
+        }
+    }
+
+    fn set_mood(&mut self, channel: &str, mood: Mood) {
+        if let Some( channel_state ) = self.channels.get_mut( channel ) {
+            channel_state.mood = mood;
+        }
+    } 
+}
+
+async fn send_passive_advice(state: &mut ChannelState<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner) {
+    let passive = lm.lists.get("passive_advice").unwrap();
     let mut rng = rand::thread_rng();
     let msg = passive[rng.gen::<usize>() % passive.len()]; 
-    let result = substitute_random(&state, msg); 
+    let result = substitute_random(lm, msg); 
     state.send_message(runner, &result).await 
 }
 
-async fn send_passive_question(state: &mut State<'_>, runner: &mut AsyncRunner) {
-    let passive = state.lists.get("questions").unwrap();
+async fn send_passive_question(state: &mut ChannelState<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner) {
+    let passive = lm.lists.get("questions").unwrap();
     let mut rng = rand::thread_rng();
     let msg = passive[rng.gen::<usize>() % passive.len()]; 
-    let result = substitute_random(&state, msg); 
+    let result = substitute_random(lm, msg); 
     state.send_message(runner, &result).await 
 }
 
-pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
+pub async fn main_loop(mut state: State<'_>, lm: &ListsMaps<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
     loop {
         match runner.next_message().await? {
             Status::Message(msg) => {
-                handle_message(&mut state, &mut runner, msg).await;
+                handle_message(&mut state, lm, &mut runner, msg).await;
             }
             Status::Quit => {
                 println!("Quitting.");
@@ -292,17 +341,19 @@ pub async fn main_loop(mut state: State<'_>, mut runner: AsyncRunner) -> Result<
             }
         }
 
-        if state.last_advice + state.next_advice < Instant::now() {
-            match state.mood {
-                Mood::Normal => {
-                    if PASSIVE_MESSAGES && !state.dedup_message { 
-                        send_passive_advice(&mut state, &mut runner).await;
-                    }
+        for ( _channel, cstate ) in &mut state.channels {
+            if cstate.last_advice + cstate.next_advice < Instant::now() {
+                match cstate.mood {
+                    Mood::Normal => {
+                        if PASSIVE_MESSAGES && !cstate.dedup_message { 
+                            send_passive_advice(cstate, lm, &mut runner).await;
+                        }
 
-                }
-                Mood::Backoff => {
-                    state.set_mood(Mood::Normal);
-                    state.next_advice = PASSIVE_ADVICE_INTERVAL;
+                    }
+                    Mood::Backoff => {
+                        cstate.set_mood(Mood::Normal);
+                        cstate.next_advice = PASSIVE_ADVICE_INTERVAL;
+                    }
                 }
             }
         }
@@ -343,13 +394,13 @@ impl<'a> Iterator for SubLocations<'a> {
     }
 }
 
-fn substitute_random(state: &State<'_>, message: &str) -> String { 
+fn substitute_random(lm: &ListsMaps<'_>, message: &str) -> String { 
     println!("substituting {}", message);
     let mut result = String::from(message);
     for substitution in SubLocations::new(message) {
         println!("found substitution location {}", substitution);
-        if substitution.len() < 3 { continue; }
-        if let Some(list) = state.lists.get(&substitution[1..substitution.len() - 1]) {
+        if substitution.len() < 3 { continue; } 
+        if let Some(list) = lm.lists.get(&substitution[1..substitution.len() - 1]) {
             let mut rng = rand::thread_rng();
             let msg = list[rng.gen::<usize>() % list.len()];
             println!("substituting {} for {}", substitution, msg);
@@ -360,149 +411,173 @@ fn substitute_random(state: &State<'_>, message: &str) -> String {
     result 
 }
 
-fn subst_fixed(_state: &State<'_>, user: &str, trigger: &str, message: &str) -> String { 
+fn subst_global(state: &ChannelState<'_>, user: &str, trigger: &str, message: &str) -> String { 
     let mut result = message.replace("{trigger}", trigger);
     result = result.replace("{user}", user);
+    result = result.replace("{channel}", state.channel_name);
+    result = result.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
     return result;
 
 }
 
-fn make_response(state: &State<'_>, user: &str, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
+fn make_response(state: &ChannelState<'_>, lm: &ListsMaps<'_>, user: &str, trigger: &str, map_value: &MapValue<'_>) -> Option<String> {
     match map_value {
         MapValue::FileName(name) => {
-            if let Some(list) = state.lists.get(*name) {
+            if let Some(list) = lm.lists.get(*name) {
                 let mut rng = rand::thread_rng();
                 let msg = list[rng.gen::<usize>() % list.len()];
                 println!("detected file {}", name);
-                let mut result = substitute_random(state, msg);
-                result = subst_fixed(state, user, trigger, &result);
+                let mut result = substitute_random(lm, msg);
+                result = subst_global(state, user, trigger, &result);
                 return Some(result);
             }
         }
         MapValue::Value(value) => {
             println!("detected value {}", value);
-            let mut result = substitute_random(state, value);
-            result = subst_fixed(state, user, trigger, &result);
+            let mut result = substitute_random(lm, value);
+            result = subst_global(state, user, trigger, &result);
             return Some(result);
         }
     } 
     return None;
 }
 
-async fn parse_command(state: &mut State<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
+async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
+    let channel = &msg.channel()[1..]; // strip the #
+    if let Some( cstate ) = state.channels.get_mut( channel ) {
+        if cstate.mood == Mood::Normal && !state.ignores.contains(msg.name()) { 
+            let lower_case = msg.data().to_lowercase();
+            // todo ignore punctuation?
+            for token in lower_case.split_whitespace() {
+                match lm.triggers.get(token) {
+                    Some(value) => {
+                        if let Some(response) = make_response(cstate, lm, msg.name(), token, value) {
+                            cstate.send_message(runner, &response).await; 
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut opt_response = None;
+            'outer: for multi_trigger in &lm.multi_triggers {
+                let mut found = false;
+                'inner: for trigger in &multi_trigger.triggers {
+                    if *trigger == "" { 
+                        if found { 
+                            break 'inner;
+                        } else {
+                            continue 'outer; 
+                        }
+                    } 
+
+                    if lower_case.contains(trigger) {
+                        found = true; 
+                    } else {
+                        found = false;
+                        break 'inner;
+                    }
+                }
+
+                if found { 
+                    opt_response = make_response(cstate, lm, msg.name(), &multi_trigger.triggers.join(" "), &multi_trigger.value);
+                }
+            }
+            if let Some(response) = opt_response {
+                cstate.send_message(runner, &response).await; 
+            } 
+        }
+    }
+    Ok(())
+}
+
+
+async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> Result<(), Box<dyn Error>> {
+    let channel = &msg.channel()[1..]; // strip the #
     if COMMAND_MESSAGES {
+        let cstate = if let Some( cstate ) = state.channels.get_mut( channel ) {
+            cstate
+        } else {
+            println!("parse_command: failed to find channel {}", channel );
+            return Err("parse command failed to find channel".into());
+        };
+
         match msg.data() {
             "!fuckoff" => {
-                state.send_message(runner, "fine, i'll fuck off").await;
-                state.next_advice = BACKOFF_ADVICE_INTERVAL;
-                state.set_mood(Mood::Backoff);
+                cstate.send_message(runner, "fine, i'll fuck off").await;
+                cstate.next_advice = BACKOFF_ADVICE_INTERVAL;
+                state.set_mood(channel, Mood::Backoff);
                 return Ok(());
             }
             "!comeback" => {
-                state.send_message(runner, "i knew you would miss me").await;
-                state.next_advice = PASSIVE_ADVICE_INTERVAL;
-                state.set_mood(Mood::Normal);
+                cstate.send_message(runner, "i knew you would miss me").await;
+                cstate.next_advice = PASSIVE_ADVICE_INTERVAL;
+                state.set_mood(channel, Mood::Normal);
                 return Ok(());
             }
             "!feed" => {
-                state.send_message(runner, "Mmm i love tendies").await;
+                cstate.send_message(runner, "Mmm i love tendies").await;
                 return Ok(());
             }
             "!bot" => {
-                state.send_message(runner, "github.com/schecko/cynobot").await;
+                cstate.send_message(runner, "github.com/schecko/cynobot").await;
                 return Ok(());
             }
             "!mood" => {
-                state.send_message(runner, &format!("Mr/Ms streamer is feeling {}", state.mood)).await;
+                cstate.send_message(runner, &format!("Mr/Ms streamer is feeling {}", cstate.mood)).await;
                 return Ok(());
             }
             "!purpose" => {
-                state.send_message(runner, "my purpose in life is to troll @SomewhatAccurate and his viewers.").await;
+                cstate.send_message(runner, "my purpose in life is to troll @SomewhatAccurate and his viewers.").await;
                 return Ok(());
             }
             "!about" => {
-                state.send_message(runner, "https://www.youtube.com/watch?v=dQw4w9WgXcQ").await;
+                cstate.send_message(runner, "https://www.youtube.com/watch?v=dQw4w9WgXcQ").await;
                 return Ok(());
             }
             "!random" => { 
-                send_passive_advice(state, runner).await;
+                send_passive_advice(cstate, lm, runner).await;
                 return Ok(());
             }
             "!question" => { 
-                send_passive_question(state, runner).await;
+                send_passive_question(cstate, lm, runner).await;
                 return Ok(());
             }
             "!ignoreme" => { 
                 let raw_response = "ignoring {user}";
-                let result = subst_fixed(state, msg.name(), "", raw_response);
+                let result = subst_global(cstate, msg.name(), "", raw_response);
                 state.ignores.insert(msg.name().to_string());
-                state.send_message(runner, &result).await;
+                cstate.send_message(runner, &result).await;
                 return Ok(());
             }
             "!noticeme" => { 
                 let raw_response = "senpai is noticing you {user}";
-                let result = subst_fixed(state, msg.name(), "", raw_response);
+                let result = subst_global(cstate, msg.name(), "", raw_response);
                 state.ignores.remove(msg.name());
-                state.send_message(runner, &result).await;
+                cstate.send_message(runner, &result).await;
                 return Ok(());
             }
             _ => {}
         }
     }
 
-    if TRIGGER_MESSAGES && state.mood == Mood::Normal && !state.ignores.contains(msg.name()) { 
-        let lower_case = msg.data().to_lowercase();
-        // todo ignore punctuation?
-        for token in lower_case.split_whitespace() {
-            match state.triggers.get(token) {
-                Some(value) => {
-                    if let Some(response) = make_response(state, msg.name(), token, value) {
-                        state.send_message(runner, &response).await; 
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut opt_response = None;
-        'outer: for multi_trigger in &state.multi_triggers {
-            let mut found = false;
-            'inner: for trigger in &multi_trigger.triggers {
-                if *trigger == "" { 
-                    if found { 
-                        break 'inner;
-                    } else {
-                        continue 'outer; 
-                    }
-                } 
-
-                if lower_case.contains(trigger) {
-                    found = true; 
-                } else {
-                    found = false;
-                    break 'inner;
-                }
-            }
-
-            if found { 
-                opt_response = make_response(state, msg.name(), &multi_trigger.triggers.join(" "), &multi_trigger.value);
-            }
-        }
-        if let Some(response) = opt_response {
-            state.send_message(runner, &response).await; 
-        } 
+    if TRIGGER_MESSAGES {
+        handle_triggers( state, lm, runner, msg ).await?;
     }
 
     Ok(())
 }
 
-async fn handle_message(state: &mut State<'_>, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
+async fn handle_message(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
     use messages::Commands::*;
     match msg {
         Privmsg(msg) => {
-            println!("[{}] {}: {}", msg.channel(), msg.name(), msg.data());
-            let _ = parse_command(state, runner, &msg).await.unwrap();
-            state.dedup_message = false;
+            let channel = &msg.channel()[1..]; // strip the #
+            println!("[{}] {}: {}", channel, msg.name(), msg.data());
+            let _ = parse_command(state, lm, runner, &msg).await.unwrap();
+            if let Some( cstate ) = state.channels.get_mut(channel) {
+                cstate.dedup_message = false;
+            }
         },
 
         // unimplemented features from crate twitchchat
