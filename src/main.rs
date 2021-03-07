@@ -50,7 +50,7 @@ pub struct MultiTrigger<'a> {
 
 // limitation: keys generated from values that contain capitals will never be tolowered, so those
 // keys will always fail to compare
-fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (Vec<MultiTrigger<'a>>, HashMap<&'a str, MapValue<'a>>) {
+fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (Vec<MultiTrigger<'a>>, HashMap<Cow<'a, str>, MapValue<'a>>) {
     let mut map = HashMap::new();
     let mut multi_triggers = Vec::new();
     for line in contents.lines() {
@@ -97,7 +97,7 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
                     }); 
                 } else {
                     if key.contains('{') { continue 'key_loop; }
-                    map.insert(*key, map_value);
+                    map.insert(subst_global(Cow::Borrowed(*key)), map_value);
                 }
             }
         }
@@ -182,7 +182,7 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
     println!("triggers {:#?}", triggers);
 
     let state = State::new(channels);
-    let lm = ListsMaps::new( triggers, multi_triggers, map);
+    let lm = ListsMaps::new( map, multi_triggers, triggers);
 
     main_loop(state, &lm, runner).await 
 }
@@ -257,14 +257,14 @@ impl<'a> ChannelState<'a> {
 pub struct ListsMaps<'a> {
     pub lists: HashMap<&'a str, Vec<&'a str>>,
     pub multi_triggers: Vec<MultiTrigger<'a>>,
-    pub triggers: HashMap<&'a str, MapValue<'a>>,
+    pub triggers: HashMap<Cow<'a, str>, MapValue<'a>>,
 }
 
 impl<'a> ListsMaps<'a> {
     fn new(
-        triggers: HashMap<&'a str, MapValue<'a>>, 
+        lists: HashMap<&'a str, Vec<&'a str>>,
         multi_triggers: Vec<MultiTrigger<'a>>, 
-        lists: HashMap<&'a str, Vec<&'a str>>
+        triggers: HashMap<Cow<'a, str>, MapValue<'a>>, 
     ) -> Self {
         ListsMaps {
             lists,
@@ -417,13 +417,21 @@ fn substitute_random<'a>(lm: &ListsMaps<'a>, message: &'a str) -> Cow<'a, str> {
     }
 }
 
-fn subst_global<'a>(state: &ChannelState<'_>, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
+fn subst_global<'a>(message: Cow<'a, str>) -> Cow<'a, str> {
+    if message.contains("{") {
+        let result = message.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
+        return Cow::Owned(result);
+    } else {
+        return message;
+    } 
+}
+
+fn subst_context<'a>(state: &ChannelState<'_>, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
     if message.contains("{") {
         let mut result = message.replace("{trigger}", trigger);
         result = result.replace("{user}", user);
         result = result.replace("{channel}", state.channel_name);
-        result = result.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
-        return Cow::Owned(result);
+        return subst_global(Cow::Owned(result));
     } else {
         return message;
     } 
@@ -437,14 +445,14 @@ fn make_response<'a>(state: &ChannelState<'_>, lm: &ListsMaps<'a>, user: &str, t
                 let msg = list[rng.gen::<usize>() % list.len()];
                 println!("detected file {}", name);
                 let mut result = substitute_random(lm, msg);
-                result = subst_global(state, user, trigger, result);
+                result = subst_context(state, user, trigger, result);
                 return Some(result);
             }
         }
         MapValue::Value(value) => {
             println!("detected value {}", value);
             let mut result = substitute_random(lm, value);
-            result = subst_global(state, user, trigger, result);
+            result = subst_context(state, user, trigger, result);
             return Some(result);
         }
     } 
@@ -480,7 +488,7 @@ async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut
                         }
                     }
 
-                    let trigger_subst = subst_global(cstate, msg.name(), "", Cow::Borrowed(trigger)); 
+                    let trigger_subst = subst_context(cstate, msg.name(), "", Cow::Borrowed(trigger)); 
                     if lower_case.contains(&*trigger_subst) {
                         found = true; 
                     } else {
@@ -555,14 +563,14 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
             }
             "!ignoreme" => { 
                 let raw_response = "ignoring {user}";
-                let result = subst_global(cstate, msg.name(), "", Cow::Borrowed(raw_response));
+                let result = subst_context(cstate, msg.name(), "", Cow::Borrowed(raw_response));
                 state.ignores.insert(msg.name().to_string());
                 cstate.send_message(runner, &result).await;
                 return Ok(());
             }
             "!noticeme" => { 
                 let raw_response = "senpai is noticing you {user}";
-                let result = subst_global(cstate, msg.name(), "", Cow::Borrowed(raw_response));
+                let result = subst_context(cstate, msg.name(), "", Cow::Borrowed(raw_response));
                 state.ignores.remove(msg.name());
                 cstate.send_message(runner, &result).await;
                 return Ok(());
