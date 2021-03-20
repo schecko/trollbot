@@ -24,10 +24,34 @@ use std::borrow::Cow;
 use std::borrow::Borrow;
 use itertools::Itertools;
 
+const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
+const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h 
+
+const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(8), Duration::from_secs(10) ); 
+
 const TRIGGERS_FILE: &str = "triggers.map";
 const CONFIG_CHANNELS: &str = "channels.list";
 const CONFIG_COMMANDS: &str = "commands.map";
 const COMMANDS_TEXT_FILE: &str = "commands_text.map";
+
+const PASSIVE_MESSAGES: bool = true;
+const TRIGGER_MESSAGES: bool = true;
+const COMMAND_MESSAGES: bool = true;
+
+pub struct MinMax<T> {
+    min: T,
+    max: T,
+}
+
+impl<T> MinMax<T> { 
+    pub const fn new(min: T, max: T) -> Self {
+        MinMax {
+            min,
+            max
+        }
+    }
+}
+
 
 fn parse_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
@@ -109,10 +133,6 @@ fn load_map<'a>(contents: &'a str, lists: &HashMap<&'a str, Vec<&'a str>>) -> (V
     } 
     (multi_triggers, map)
 }
-
-const PASSIVE_MESSAGES: bool = true;
-const TRIGGER_MESSAGES: bool = true;
-const COMMAND_MESSAGES: bool = true;
 
 async fn connect(user_config: &UserConfig, channels: &Vec<&str>) -> anyhow::Result<AsyncRunner> {
     let connector = connector::tokio::ConnectorRustTls::twitch()?;
@@ -235,9 +255,6 @@ pub fn get_config<'a>(channel_content: &'a str) -> Result<(twitchchat::UserConfi
     Ok((config, channels))
 }
 
-const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
-const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
-
 #[derive(Display, PartialEq, Eq)]
 pub enum Mood {
     #[strum(to_string = "normal")]
@@ -247,11 +264,14 @@ pub enum Mood {
 }
 
 pub struct ChannelState<'a> {
-    pub mood: Mood,
-    pub last_advice: Instant,
-    pub next_advice: Duration,
-    pub dedup_message: bool, 
     pub channel_name: &'a str,
+    pub dedup_message: bool, 
+    pub direct_message: bool,
+    pub last_advice: Instant,
+    pub last_message: Instant,
+    pub mood: Mood,
+    pub next_advice: Duration,
+    pub next_message: MinMax<Duration>,
 }
 
 impl<'a> ChannelState<'a> { 
@@ -260,12 +280,22 @@ impl<'a> ChannelState<'a> {
     }
 
     async fn send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
+        let mut rng = rand::thread_rng();
+        let next_message = rng.gen_range(self.next_message.min..self.next_message.max);
+        if self.direct_message || self.last_message + next_message < Instant::now() {
+            self.force_send_message(runner, msg).await;
+        }
+    }
+
+    async fn force_send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
         let mut writer = runner.writer();
         let cmd = commands::privmsg(&self.channel_name, msg);
         writer.encode(cmd).await.unwrap();
 
         self.dedup_message = true;
         self.last_advice = Instant::now();
+        self.last_message = Instant::now();
+        self.direct_message = false;
     }
 }
 
@@ -311,11 +341,14 @@ impl<'a> State<'a> {
                 (
                     chan, 
                     ChannelState { 
-                        mood: Mood::Normal, 
-                        last_advice: Instant::now(), 
-                        next_advice: PASSIVE_ADVICE_INTERVAL, 
-                        dedup_message: false,
+                        direct_message: false,
                         channel_name: chan,
+                        dedup_message: false,
+                        last_advice: Instant::now(), 
+                        last_message: Instant::now(),
+                        mood: Mood::Normal, 
+                        next_advice: PASSIVE_ADVICE_INTERVAL, 
+                        next_message: PASSIVE_MESSAGE_RANGE,
                     } 
                 ) } )
                 .collect();
@@ -549,12 +582,42 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
             was_command = true;
         }
 
-        if let Some(MapValue::Value(command)) = lm.commands.get(msg.data()) {
+        if let Some(MapValue::Value(command)) = lm.commands.get(msg.data().split_whitespace().next().unwrap_or("")) {
             match *command {
                 "COMMANDS" => {
                     let keys: HashSet<&str> = lm.command_text.keys().chain( lm.commands.keys() ).map(|k| k.borrow()).collect();
                     let msg: String = keys.iter().join(", ");
                     cstate.send_message(runner, &msg).await; 
+                    return Ok(());
+                }
+                "CONFIG" => {
+                    println!("blah");
+                    let lower_case = msg.data().to_lowercase();
+                    let mut iter = lower_case.split_whitespace();
+                    iter.next(); // ignore the command, which would be the substituted "CONFIG"
+                    
+                    match iter.next() {
+                        Some("cd") => {
+                            println!("blah2");
+                            let error_msg = "invalid command, expected format \"cd <min> <max>\" where <min> and <max> are integer numbers";
+                            if let (Some(min_str), Some(max_str)) = (iter.next(), iter.next()) {
+                                if let (Ok(a), Ok(b)) = (min_str.parse::<u64>(), max_str.parse::<u64>()) {
+                                    let min = if a > b { b } else { a };
+                                    let max = if a > b { a } else { b }; 
+                                    cstate.next_message = MinMax::new(Duration::from_secs(min), Duration::from_secs(max));
+                                    cstate.force_send_message(runner, &format!("successfully changed message cooldown to {}s-{}s", min, max)).await;
+                                } else {
+                                    cstate.force_send_message(runner, error_msg).await;
+                                }
+                            } else {
+                                cstate.force_send_message(runner, error_msg).await;
+                            }
+                        }
+                        _ => {
+                            println!("detected unknown CONFIG subcommand in '{}'", msg.data());
+                        } 
+                    } 
+                    
                     return Ok(());
                 }
                 "LEAVE" => {
