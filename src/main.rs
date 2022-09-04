@@ -210,11 +210,11 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
     let command_content = load_config_file(CONFIG_COMMANDS)?;
     let (_, commands) = load_map(&command_content, &map); 
 
-    println!("lists {:#?}", map);
-    println!("multi triggers {:#?}", multi_triggers);
-    println!("triggers {:#?}", triggers);
-    println!("commands {:#?}", commands);
-    println!("commands text {:#?}", commands_text);
+    //println!("lists {:#?}", map);
+    //println!("multi triggers {:#?}", multi_triggers);
+    //println!("triggers {:#?}", triggers);
+    //println!("commands {:#?}", commands);
+    //println!("commands text {:#?}", commands_text);
 
     let state = State::new(channels);
     let lm = ListsMaps::new( commands, commands_text, map, multi_triggers, triggers);
@@ -272,6 +272,7 @@ pub struct ChannelState<'a> {
     pub mood: Mood,
     pub next_advice: Duration,
     pub next_message: MinMax<Duration>,
+    pub off_topic: Option<Instant>,
 }
 
 impl<'a> ChannelState<'a> { 
@@ -349,6 +350,7 @@ impl<'a> State<'a> {
                         mood: Mood::Normal, 
                         next_advice: PASSIVE_ADVICE_INTERVAL, 
                         next_message: PASSIVE_MESSAGE_RANGE,
+                        off_topic: None,
                     } 
                 ) } )
                 .collect();
@@ -513,6 +515,11 @@ fn make_response<'a>(state: &ChannelState<'_>, lm: &ListsMaps<'a>, user: &str, t
     return None;
 }
 
+fn make_response_message<'b>(state: &ChannelState<'_>, lm: &ListsMaps<'b>, user: &str, trigger: &str, msg: &'b str) -> Cow<'b, str> {
+    let result = substitute_random(lm, msg);
+    return subst_context(state, user, trigger, result);
+}
+
 async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     let channel = &msg.channel()[1..]; // strip the #
     if let Some( cstate ) = state.channels.get_mut( channel ) {
@@ -576,6 +583,7 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
 
         let mut was_command = false;
         if let Some(MapValue::Value(command_text)) = lm.command_text.get(msg.data()) {
+            println!("got command {}", command_text);
             let result = subst_context(cstate, msg.name(), msg.data(), Cow::Borrowed(command_text));
 
             cstate.send_message(runner, &result).await;
@@ -591,14 +599,12 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                     return Ok(());
                 }
                 "CONFIG" => {
-                    println!("blah");
                     let lower_case = msg.data().to_lowercase();
                     let mut iter = lower_case.split_whitespace();
                     iter.next(); // ignore the command, which would be the substituted "CONFIG"
                     
                     match iter.next() {
                         Some("cd") => {
-                            println!("blah2");
                             let error_msg = "invalid command, expected format \"cd <min> <max>\" where <min> and <max> are integer numbers";
                             if let (Some(min_str), Some(max_str)) = (iter.next(), iter.next()) {
                                 if let (Ok(a), Ok(b)) = (min_str.parse::<u64>(), max_str.parse::<u64>()) {
@@ -644,6 +650,26 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 }
                 "NOTICE_ME" => { 
                     state.ignores.remove(msg.name());
+                    return Ok(());
+                }
+                "OFF_TOPIC" => { 
+                    let response = match &cstate.off_topic {
+                        Some(stamp) => format!("{channel} has already been off topic for {}s", Instant::now().duration_since(*stamp).as_secs()),
+                        None => {
+                            cstate.off_topic = Some(Instant::now());
+                            format!("starting off topic timer")
+                        }
+                    };
+
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "OFF_TOPIC", &response)).await;
+                    return Ok(());
+                }
+                "ON_TOPIC" => { 
+                    if let Some(start) = cstate.off_topic.take() {
+                        let duration = Instant::now().duration_since(start);
+                        let response = format!("{channel} is finally on topic, it took them {}h {}m {}s", duration.as_secs() / 60 / 60 / 24, duration.as_secs() / 60, duration.as_secs());
+                        cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "ON_TOPIC", &response)).await;
+                    }
                     return Ok(());
                 }
                 _ => {}

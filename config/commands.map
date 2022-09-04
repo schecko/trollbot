@@ -6,3 +6,5 @@
 !ignoreme=IGNORE_ME
 !help=COMMANDS
 !config=CONFIG
+!ontopic=ON_TOPIC
+!offtopic=OFF_TOPIC
