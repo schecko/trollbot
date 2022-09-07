@@ -273,6 +273,8 @@ pub struct ChannelState<'a> {
     pub next_advice: Duration,
     pub next_message: MinMax<Duration>,
     pub off_topic: Option<Instant>,
+    pub current_topic: Option<String>,
+    pub total_off_topic: Duration,
 }
 
 impl<'a> ChannelState<'a> { 
@@ -351,6 +353,8 @@ impl<'a> State<'a> {
                         next_advice: PASSIVE_ADVICE_INTERVAL, 
                         next_message: PASSIVE_MESSAGE_RANGE,
                         off_topic: None,
+                        current_topic: None,
+                        total_off_topic: Duration::new(0, 0),
                     } 
                 ) } )
                 .collect();
@@ -590,7 +594,9 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
             was_command = true;
         }
 
-        if let Some(MapValue::Value(command)) = lm.commands.get(msg.data().split_whitespace().next().unwrap_or("")) {
+        let mut commands = msg.data().split_whitespace();
+
+        if let Some(MapValue::Value(command)) = lm.commands.get(commands.next().unwrap_or("")) {
             match *command {
                 "COMMANDS" => {
                     let keys: HashSet<&str> = lm.command_text.keys().chain( lm.commands.keys() ).map(|k| k.borrow()).collect();
@@ -654,7 +660,10 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 }
                 "OFF_TOPIC" => { 
                     let response = match &cstate.off_topic {
-                        Some(stamp) => format!("{channel} has already been off topic for {}s", Instant::now().duration_since(*stamp).as_secs()),
+                        Some(stamp) => {
+                            let duration = Instant::now().duration_since(*stamp);
+                            format!("{channel} has already been off topic for {}h {}m {}s", duration.as_secs() / 60 / 60, duration.as_secs() / 60 % 60, duration.as_secs() % 60 )
+                        }
                         None => {
                             cstate.off_topic = Some(Instant::now());
                             format!("starting off topic timer")
@@ -667,9 +676,21 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 "ON_TOPIC" => { 
                     if let Some(start) = cstate.off_topic.take() {
                         let duration = Instant::now().duration_since(start);
-                        let response = format!("{channel} is finally on topic, it took them {}h {}m {}s", duration.as_secs() / 60 / 60 / 24, duration.as_secs() / 60, duration.as_secs());
+                        cstate.total_off_topic += duration;
+                        let response = format!("{channel} is finally on topic, it took them {}h {}m {}s", duration.as_secs() / 60 / 60, duration.as_secs() / 60 % 60, duration.as_secs() % 60 );
                         cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "ON_TOPIC", &response)).await;
                     }
+                    return Ok(());
+                }
+                "TOTAL_OFF_TOPIC" => { 
+                    let response = format!("The streamer has been off topic a total of {}h {}m {}s", cstate.total_off_topic.as_secs() / 60 / 60, cstate.total_off_topic.as_secs() / 60 % 60, cstate.total_off_topic.as_secs() % 60 );
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "TOTAL_OFF_TOPIC", &response)).await;
+                    return Ok(());
+                }
+                "SET_TOPIC" => { 
+                    let topic = commands.next().unwrap_or("");
+                    let response = format!("current topic is now {}", topic);
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "SET_TOPIC", &response)).await;
                     return Ok(());
                 }
                 _ => {}
