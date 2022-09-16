@@ -24,10 +24,10 @@ use std::borrow::Cow;
 use std::borrow::Borrow;
 use itertools::Itertools;
 
-const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 30); // 30min
-const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h 
+const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 3); // 3h
+const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
 
-const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(8), Duration::from_secs(10) ); 
+const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(600), Duration::from_secs(800) ); 
 
 const TRIGGERS_FILE: &str = "triggers.map";
 const CONFIG_CHANNELS: &str = "channels.list";
@@ -51,7 +51,6 @@ impl<T> MinMax<T> {
         }
     }
 }
-
 
 fn parse_list<'a>(contents: &'a str) -> Vec<&'a str> {
     let mut data = Vec::new();
