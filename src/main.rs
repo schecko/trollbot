@@ -1,33 +1,31 @@
 // TODO 
 // - per trigger cooldowns
-extern crate tokio;
-extern crate anyhow;
-extern crate rand;
-extern crate strum;
-extern crate itertools;
-
 use twitchchat::{
     commands, connector, messages,
     runner::{AsyncRunner, Status},
     UserConfig,
 };
 use anyhow::Context as _;
-use std::time::{ Duration, Instant };
+use itertools::Itertools;
 use rand::Rng;
-use strum::*;
+use serde::{ Serialize, Deserialize };
+use std::borrow::Borrow;
+use std::borrow::Cow;
 use std::collections::{ HashMap, HashSet };
+use std::error::Error;
 use std::fs::{ self, File };
+use std::hash::{ Hash, Hasher };
 use std::io::prelude::*;
 use std::path::{ Path, PathBuf };
-use std::error::Error;
-use std::borrow::Cow;
-use std::borrow::Borrow;
-use itertools::Itertools;
+use std::time::{ Duration, SystemTime };
+use strum::*;
 
 const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 3); // 3h
 const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
 
 const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(600), Duration::from_secs(800) ); 
+
+const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 const TRIGGERS_FILE: &str = "triggers.map";
 const CONFIG_CHANNELS: &str = "channels.list";
@@ -38,6 +36,7 @@ const PASSIVE_MESSAGES: bool = true;
 const TRIGGER_MESSAGES: bool = true;
 const COMMAND_MESSAGES: bool = true;
 
+#[derive(Deserialize, Serialize)]
 pub struct MinMax<T> {
     min: T,
     max: T,
@@ -174,6 +173,12 @@ fn load_file(full_path: &Path) -> anyhow::Result<String> {
     Ok(contents)
 }
 
+fn user_dir() -> anyhow::Result<PathBuf> {
+    let mut path = dirs::home_dir().unwrap();
+    path.push("cynobot");
+    Ok(path)
+}
+
 async fn connect_run() -> Result<(), Box<dyn Error>> {
     let channels_content = load_config_file(CONFIG_CHANNELS)?;
     let (user_config, channels) = get_config(&channels_content)?;
@@ -215,21 +220,34 @@ async fn connect_run() -> Result<(), Box<dyn Error>> {
     //println!("commands {:#?}", commands);
     //println!("commands text {:#?}", commands_text);
 
-    let state = State::new(channels);
+    let meta_state = MetaState::new();
+    let state = MetaState::try_read_state(channels);
     let lm = ListsMaps::new( commands, commands_text, map, multi_triggers, triggers);
 
-    main_loop(state, &lm, runner).await 
+    main_loop(meta_state, state, &lm, runner).await 
 }
 
 #[tokio::main]
 async fn main() { 
+    let mut last_start_time = SystemTime::now();
+    let mut fail_count = 0;
     loop {
+        let start_time = SystemTime::now();
         match connect_run().await {
             Ok(_) => {}
             Err(e) => {
                 println!("error in main {:?}", e);
             }
         }
+        if start_time.duration_since(last_start_time).unwrap() < Duration::from_secs( 60 * 60 ) {
+            fail_count += 1;
+        } else {
+            fail_count = 0;
+        }
+        let sleep_duration = Duration::from_secs(2u64.pow(fail_count));
+        println!("disconnected, reconnecting in {:?}s", sleep_duration);
+        std::thread::sleep(sleep_duration);
+        last_start_time = start_time;
     }
 }
 
@@ -254,7 +272,7 @@ pub fn get_config<'a>(channel_content: &'a str) -> Result<(twitchchat::UserConfi
     Ok((config, channels))
 }
 
-#[derive(Display, PartialEq, Eq)]
+#[derive(Display, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mood {
     #[strum(to_string = "normal")]
     Normal,
@@ -262,21 +280,38 @@ pub enum Mood {
     Backoff,
 }
 
-pub struct ChannelState<'a> {
-    pub channel_name: &'a str,
+#[derive(Serialize, Deserialize)]
+pub struct ChannelState {
+    pub channel_name: String,
     pub dedup_message: bool, 
     pub direct_message: bool,
-    pub last_advice: Instant,
-    pub last_message: Instant,
+    pub last_advice: SystemTime,
+    pub last_message: SystemTime,
     pub mood: Mood,
     pub next_advice: Duration,
     pub next_message: MinMax<Duration>,
-    pub off_topic: Option<Instant>,
+    pub off_topic: Option<SystemTime>,
     pub current_topic: Option<String>,
     pub total_off_topic: Duration,
 }
 
-impl<'a> ChannelState<'a> { 
+impl ChannelState { 
+    fn new(channel_name: &str) -> Self {
+        Self { 
+            direct_message: false,
+            channel_name: String::from(channel_name),
+            dedup_message: false,
+            last_advice: SystemTime::now(), 
+            last_message: SystemTime::now(),
+            mood: Mood::Normal, 
+            next_advice: PASSIVE_ADVICE_INTERVAL, 
+            next_message: PASSIVE_MESSAGE_RANGE,
+            off_topic: None,
+            current_topic: None,
+            total_off_topic: Duration::new(0, 0),
+        } 
+    }
+
     fn set_mood(&mut self, mood: Mood) {
         self.mood = mood;
     }
@@ -284,7 +319,7 @@ impl<'a> ChannelState<'a> {
     async fn send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
         let mut rng = rand::thread_rng();
         let next_message = rng.gen_range(self.next_message.min..self.next_message.max);
-        if self.direct_message || self.last_message + next_message < Instant::now() {
+        if self.direct_message || self.last_message + next_message < SystemTime::now() {
             self.force_send_message(runner, msg).await;
         }
     }
@@ -295,8 +330,8 @@ impl<'a> ChannelState<'a> {
         writer.encode(cmd).await.unwrap();
 
         self.dedup_message = true;
-        self.last_advice = Instant::now();
-        self.last_message = Instant::now();
+        self.last_advice = SystemTime::now();
+        self.last_message = SystemTime::now();
         self.direct_message = false;
     }
 }
@@ -328,66 +363,131 @@ impl<'a> ListsMaps<'a> {
 
 }
 
-pub struct State<'a> {
-    pub channels: HashMap<&'a str, ChannelState<'a>>,
+pub struct MetaState
+{
+    pub next_state_save: SystemTime,
+}
+
+impl MetaState
+{
+    fn new() -> Self
+    {
+        MetaState {
+            next_state_save: SystemTime::now() + STATE_SAVE_INTERVAL,
+        }
+    }
+
+    fn try_write_state(&mut self, state: &State) -> anyhow::Result<()>
+    {
+        if self.next_state_save < SystemTime::now() {
+            let mut state_file_name = user_dir()?;
+            state_file_name.push("state.json");
+            std::fs::create_dir_all(state_file_name.parent().unwrap()).unwrap();
+
+            let serialized = serde_json::to_string(state);
+            let mut file = File::options()
+                .write(true)
+                .create(true)
+                .open(state_file_name)
+                .unwrap();
+            // TODO: 'atomic' write file
+            file.write_all(serialized.unwrap().as_bytes());
+            self.next_state_save = SystemTime::now() + STATE_SAVE_INTERVAL;
+        }
+        Ok(())
+    }
+
+    fn try_read_state<'a>(channels: Vec<&'a str>) -> State
+    {
+        let mut state_file_name = user_dir().unwrap();
+        state_file_name.push("state.json");
+
+        let contents = match load_file(&state_file_name) {
+            Ok(contents) => contents,
+            Err(_err) => return State::new(channels),
+        };
+        
+        // assume we want to crash if file exists but deserialization fails
+        State::merge(channels, serde_json::from_str(&contents).unwrap())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct State {
+    // TODO: improve. hash is from channel name... just don't want to allocate every query...
+    pub channels: HashMap<u64, ChannelState>,
     pub ignores: HashSet<String>,
 }
 
-impl<'a> State<'a> {
-    fn new(
-        channels: Vec<&'a str>, 
-    ) -> Self {
+impl State {
+    fn new(channels: Vec<&str>) -> Self
+    {
+        println!("creating new state");
         let chans = channels
-                .iter()
-                .map(|&chan| { 
-                (
-                    chan, 
-                    ChannelState { 
-                        direct_message: false,
-                        channel_name: chan,
-                        dedup_message: false,
-                        last_advice: Instant::now(), 
-                        last_message: Instant::now(),
-                        mood: Mood::Normal, 
-                        next_advice: PASSIVE_ADVICE_INTERVAL, 
-                        next_message: PASSIVE_MESSAGE_RANGE,
-                        off_topic: None,
-                        current_topic: None,
-                        total_off_topic: Duration::new(0, 0),
-                    } 
-                ) } )
-                .collect();
+            .iter()
+            .map(|&chan| { 
+            (
+                State::chash(chan), 
+                ChannelState::new(chan),
+            ) } )
+            .collect();
+
         State {
             channels: chans,
             ignores: HashSet::new(),
         }
     }
 
+    fn chash(channel_name: &str) -> u64 {
+        // TODO ensure the hash is stable for io
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        channel_name.hash(&mut s);
+        s.finish()
+    }
+
+    fn merge(channels: Vec<&str>, mut state: State) -> State
+    {
+        for channel in channels {
+            state.channels.entry(Self::chash(channel)).or_insert_with(|| ChannelState::new(channel));
+        }
+        state
+    }
+
     fn set_mood(&mut self, channel: &str, mood: Mood) {
-        if let Some( channel_state ) = self.channels.get_mut( channel ) {
+        if let Some( channel_state ) = self.channels.get_mut(&State::chash(channel)) {
             channel_state.mood = mood;
         }
     } 
 }
 
-async fn send_passive_advice(state: &mut ChannelState<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner) {
+async fn send_passive_advice(state: &mut ChannelState, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, force: bool) {
     let passive = lm.lists.get("passive_advice").unwrap();
     let mut rng = rand::thread_rng();
     let msg = passive[rng.gen::<usize>() % passive.len()]; 
     let result = substitute_random(lm, msg); 
-    state.send_message(runner, &result).await 
+    if force {
+        state.force_send_message(runner, &result).await
+    } else {
+        state.send_message(runner, &result).await
+    }
 }
 
-async fn send_passive_question(state: &mut ChannelState<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner) {
+async fn send_passive_question(state: &mut ChannelState, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, force: bool) {
     let passive = lm.lists.get("questions").unwrap();
     let mut rng = rand::thread_rng();
     let msg = passive[rng.gen::<usize>() % passive.len()]; 
     let result = substitute_random(lm, msg); 
-    state.send_message(runner, &result).await 
+    if force {
+        state.force_send_message(runner, &result).await
+    } else {
+        state.send_message(runner, &result).await
+    }
 }
 
-pub async fn main_loop(mut state: State<'_>, lm: &ListsMaps<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
+pub async fn main_loop(mut meta_state: MetaState, mut state: State, lm: &ListsMaps<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
     loop {
+        meta_state.try_write_state(&state);
+
         match runner.next_message().await? {
             Status::Message(msg) => {
                 handle_message(&mut state, lm, &mut runner, msg).await;
@@ -403,11 +503,11 @@ pub async fn main_loop(mut state: State<'_>, lm: &ListsMaps<'_>, mut runner: Asy
         }
 
         for ( _channel, cstate ) in &mut state.channels {
-            if cstate.last_advice + cstate.next_advice < Instant::now() {
+            if cstate.last_advice + cstate.next_advice < SystemTime::now() {
                 match cstate.mood {
                     Mood::Normal => {
                         if PASSIVE_MESSAGES && !cstate.dedup_message { 
-                            send_passive_advice(cstate, lm, &mut runner).await;
+                            send_passive_advice(cstate, lm, &mut runner, false).await;
                         }
 
                     }
@@ -485,18 +585,18 @@ fn subst_global<'a>(message: Cow<'a, str>) -> Cow<'a, str> {
     } 
 }
 
-fn subst_context<'a>(state: &ChannelState<'_>, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
+fn subst_context<'a>(state: &ChannelState, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
     if message.contains("{") {
         let mut result = message.replace("{trigger}", trigger);
         result = result.replace("{user}", user);
-        result = result.replace("{channel}", state.channel_name);
+        result = result.replace("{channel}", &state.channel_name);
         return subst_global(Cow::Owned(result));
     } else {
         return message;
     } 
 }
 
-fn make_response<'a>(state: &ChannelState<'_>, lm: &ListsMaps<'a>, user: &str, trigger: &str, map_value: &MapValue<'a>) -> Option<Cow<'a, str>> {
+fn make_response<'a>(state: &ChannelState, lm: &ListsMaps<'a>, user: &str, trigger: &str, map_value: &MapValue<'a>) -> Option<Cow<'a, str>> {
     match map_value {
         MapValue::FileName(name) => {
             if let Some(list) = lm.lists.get(*name) {
@@ -518,14 +618,14 @@ fn make_response<'a>(state: &ChannelState<'_>, lm: &ListsMaps<'a>, user: &str, t
     return None;
 }
 
-fn make_response_message<'b>(state: &ChannelState<'_>, lm: &ListsMaps<'b>, user: &str, trigger: &str, msg: &'b str) -> Cow<'b, str> {
+fn make_response_message<'b>(state: &ChannelState, lm: &ListsMaps<'b>, user: &str, trigger: &str, msg: &'b str) -> Cow<'b, str> {
     let result = substitute_random(lm, msg);
     return subst_context(state, user, trigger, result);
 }
 
-async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
+async fn handle_triggers(state: &mut State, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
     let channel = &msg.channel()[1..]; // strip the #
-    if let Some( cstate ) = state.channels.get_mut( channel ) {
+    if let Some( cstate ) = state.channels.get_mut(&State::chash(channel)) {
         if cstate.mood == Mood::Normal && !state.ignores.contains(msg.name()) { 
             let lower_case = msg.data().to_lowercase();
             // todo ignore punctuation?
@@ -574,10 +674,10 @@ async fn handle_triggers(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut
 }
 
 
-async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> Result<(), Box<dyn Error>> {
+async fn parse_command(state: &mut State, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> Result<(), Box<dyn Error>> {
     let channel = &msg.channel()[1..]; // strip the #
     if COMMAND_MESSAGES {
-        let cstate = if let Some( cstate ) = state.channels.get_mut( channel ) {
+        let cstate = if let Some( cstate ) = state.channels.get_mut(&State::chash(channel)) {
             cstate
         } else {
             println!("parse_command: failed to find channel {}", channel );
@@ -589,7 +689,7 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
             println!("got command {}", command_text);
             let result = subst_context(cstate, msg.name(), msg.data(), Cow::Borrowed(command_text));
 
-            cstate.send_message(runner, &result).await;
+            cstate.force_send_message(runner, &result).await;
             was_command = true;
         }
 
@@ -600,7 +700,7 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 "COMMANDS" => {
                     let keys: HashSet<&str> = lm.command_text.keys().chain( lm.commands.keys() ).map(|k| k.borrow()).collect();
                     let msg: String = keys.iter().join(", ");
-                    cstate.send_message(runner, &msg).await; 
+                    cstate.force_send_message(runner, &msg).await; 
                     return Ok(());
                 }
                 "CONFIG" => {
@@ -642,11 +742,11 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                     return Ok(());
                 }
                 "RANDOM_STATEMENT" => { 
-                    send_passive_advice(cstate, lm, runner).await;
+                    send_passive_advice(cstate, lm, runner, true).await;
                     return Ok(());
                 }
                 "RANDOM_QUESTION" => { 
-                    send_passive_question(cstate, lm, runner).await;
+                    send_passive_question(cstate, lm, runner, true).await;
                     return Ok(());
                 }
                 "IGNORE_ME" => { 
@@ -660,11 +760,14 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 "OFF_TOPIC" => { 
                     let response = match &cstate.off_topic {
                         Some(stamp) => {
-                            let duration = Instant::now().duration_since(*stamp);
-                            format!("{channel} has already been off topic for {}h {}m {}s", duration.as_secs() / 60 / 60, duration.as_secs() / 60 % 60, duration.as_secs() % 60 )
+                            let duration = SystemTime::now().duration_since(*stamp).unwrap();
+                            format!("{channel} has already been off topic for {}h {}m {}s",
+                                    duration.as_secs() / 60 / 60,
+                                    duration.as_secs() / 60 % 60,
+                                    duration.as_secs() % 60 )
                         }
                         None => {
-                            cstate.off_topic = Some(Instant::now());
+                            cstate.off_topic = Some(SystemTime::now());
                             format!("starting off topic timer")
                         }
                     };
@@ -674,7 +777,7 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
                 }
                 "ON_TOPIC" => { 
                     if let Some(start) = cstate.off_topic.take() {
-                        let duration = Instant::now().duration_since(start);
+                        let duration = SystemTime::now().duration_since(start).unwrap();
                         cstate.total_off_topic += duration;
                         let response = format!("{channel} is finally on topic, it took them {}h {}m {}s", duration.as_secs() / 60 / 60, duration.as_secs() / 60 % 60, duration.as_secs() % 60 );
                         cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "ON_TOPIC", &response)).await;
@@ -709,14 +812,14 @@ async fn parse_command(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut A
     Ok(())
 }
 
-async fn handle_message(state: &mut State<'_>, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
+async fn handle_message(state: &mut State, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: messages::Commands<'_>) {
     use messages::Commands::*;
     match msg {
         Privmsg(msg) => {
             let channel = &msg.channel()[1..]; // strip the #
             println!("[{}] {}: {}", channel, msg.name(), msg.data());
             let _ = parse_command(state, lm, runner, &msg).await.unwrap();
-            if let Some( cstate ) = state.channels.get_mut(channel) {
+            if let Some( cstate ) = state.channels.get_mut(&State::chash(channel)) {
                 cstate.dedup_message = false;
             }
         },
