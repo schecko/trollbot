@@ -377,21 +377,37 @@ impl MetaState
         }
     }
 
+    fn clean_temp_files() -> anyhow::Result<()>
+    {
+        for dir_entry in std::fs::read_dir(user_dir()?)? {
+            let path = dir_entry?.path();
+            let temp_ext = std::ffi::OsStr::new("temp");
+            if path.extension().filter(|ext| ext == &temp_ext).is_some() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn try_write_state(&mut self, state: &State) -> anyhow::Result<()>
     {
         if self.next_state_save < SystemTime::now() {
-            let mut state_file_name = user_dir()?;
-            state_file_name.push("state.json");
-            std::fs::create_dir_all(state_file_name.parent().unwrap()).unwrap();
-
+            let mut temp_file = user_dir()?;
+            temp_file.push(format!("{}-state.json.temp", rand::thread_rng().gen::<u32>()));
             let serialized = serde_json::to_string(state);
+            std::fs::create_dir_all(&temp_file.parent().unwrap()).unwrap();
             let mut file = File::options()
                 .write(true)
                 .create(true)
-                .open(state_file_name)
+                .open(&temp_file)
                 .unwrap();
-            // TODO: 'atomic' write file
+
             file.write_all(serialized.unwrap().as_bytes());
+
+            let mut state_file_name = user_dir()?;
+            state_file_name.push("state.json");
+            std::fs::create_dir_all(state_file_name.parent().unwrap()).unwrap();
+            std::fs::rename(temp_file, state_file_name)?;
             self.next_state_save = SystemTime::now() + STATE_SAVE_INTERVAL;
         }
         Ok(())
@@ -486,6 +502,7 @@ async fn send_passive_question(state: &mut ChannelState, lm: &ListsMaps<'_>, run
 
 pub async fn main_loop(mut meta_state: MetaState, mut state: State, lm: &ListsMaps<'_>, mut runner: AsyncRunner) -> Result<(), Box<dyn Error>> {
     loop {
+        MetaState::clean_temp_files();
         meta_state.try_write_state(&state);
 
         match runner.next_message().await? {
