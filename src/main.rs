@@ -23,7 +23,7 @@ use strum::*;
 const PASSIVE_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 3); // 3h
 const BACKOFF_ADVICE_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24); // 24h
 
-const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(600), Duration::from_secs(800) ); 
+const PASSIVE_MESSAGE_RANGE: MinMax::<Duration> = MinMax::<Duration>::new( Duration::from_secs(1200), Duration::from_secs(1800) ); 
 
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -325,6 +325,7 @@ impl ChannelState {
     }
 
     async fn force_send_message(&mut self, runner: &mut AsyncRunner, msg: &str) {
+        println!("sending message [{}]", msg);
         let mut writer = runner.writer();
         let cmd = commands::privmsg(&self.channel_name, msg);
         writer.encode(cmd).await.unwrap();
@@ -593,6 +594,13 @@ fn substitute_random<'a>(lm: &ListsMaps<'a>, message: &'a str) -> Cow<'a, str> {
     }
 }
 
+struct ReplyContext<'a>
+{
+    user: &'a str,
+    trigger: &'a str,
+    trigger_message: &'a str,
+}
+
 fn subst_global<'a>(message: Cow<'a, str>) -> Cow<'a, str> {
     if message.contains("{") {
         let result = message.replace("{me}", "somewhatinaccurate"); // TODO get this from somewhere
@@ -602,10 +610,11 @@ fn subst_global<'a>(message: Cow<'a, str>) -> Cow<'a, str> {
     } 
 }
 
-fn subst_context<'a>(state: &ChannelState, user: &str, trigger: &str, message: Cow<'a, str>) -> Cow<'a, str> { 
+fn subst_context<'a>(state: &ChannelState, context: &ReplyContext<'_>, message: Cow<'a, str>) -> Cow<'a, str> { 
     if message.contains("{") {
-        let mut result = message.replace("{trigger}", trigger);
-        result = result.replace("{user}", user);
+        let mut result = message.replace("{trigger}", context.trigger);
+        result = result.replace("{trigger_message}", context.trigger_message);
+        result = result.replace("{user}", context.user);
         result = result.replace("{channel}", &state.channel_name);
         return subst_global(Cow::Owned(result));
     } else {
@@ -613,7 +622,7 @@ fn subst_context<'a>(state: &ChannelState, user: &str, trigger: &str, message: C
     } 
 }
 
-fn make_response<'a>(state: &ChannelState, lm: &ListsMaps<'a>, user: &str, trigger: &str, map_value: &MapValue<'a>) -> Option<Cow<'a, str>> {
+fn make_response<'a>(state: &ChannelState, lm: &ListsMaps<'a>, context: &ReplyContext<'_>, map_value: &MapValue<'a>) -> Option<Cow<'a, str>> {
     match map_value {
         MapValue::FileName(name) => {
             if let Some(list) = lm.lists.get(*name) {
@@ -621,23 +630,23 @@ fn make_response<'a>(state: &ChannelState, lm: &ListsMaps<'a>, user: &str, trigg
                 let msg = list[rng.gen::<usize>() % list.len()];
                 println!("detected file {}", name);
                 let mut result = substitute_random(lm, msg);
-                result = subst_context(state, user, trigger, result);
+                result = subst_context(state, context, result);
                 return Some(result);
             }
         }
         MapValue::Value(value) => {
             println!("detected value {}", value);
             let mut result = substitute_random(lm, value);
-            result = subst_context(state, user, trigger, result);
+            result = subst_context(state, context, result);
             return Some(result);
         }
     } 
     return None;
 }
 
-fn make_response_message<'b>(state: &ChannelState, lm: &ListsMaps<'b>, user: &str, trigger: &str, msg: &'b str) -> Cow<'b, str> {
+fn make_response_message<'b>(state: &ChannelState, lm: &ListsMaps<'b>, context: &ReplyContext<'_>, msg: &'b str) -> Cow<'b, str> {
     let result = substitute_random(lm, msg);
-    return subst_context(state, user, trigger, result);
+    return subst_context(state, context, result);
 }
 
 async fn handle_triggers(state: &mut State, lm: &ListsMaps<'_>, runner: &mut AsyncRunner, msg: &messages::Privmsg<'_>) -> anyhow::Result<()> {
@@ -649,7 +658,13 @@ async fn handle_triggers(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Asy
             for token in lower_case.split_whitespace() {
                 match lm.triggers.get(token) {
                     Some(value) => {
-                        if let Some(response) = make_response(cstate, lm, msg.name(), token, value) {
+                        let context = ReplyContext
+                        {
+                            user: msg.name(),
+                            trigger: token,
+                            trigger_message: msg.data(),
+                        };
+                        if let Some(response) = make_response(cstate, lm, &context, value) {
                             cstate.send_message(runner, &response).await; 
                         }
                     }
@@ -669,7 +684,14 @@ async fn handle_triggers(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Asy
                         }
                     }
 
-                    let trigger_subst = subst_context(cstate, msg.name(), "", Cow::Borrowed(trigger)); 
+                    let context = ReplyContext
+                    {
+                        user: msg.name(),
+                        trigger: "",
+                        trigger_message: msg.data(),
+                    };
+
+                    let trigger_subst = subst_context(cstate, &context, Cow::Borrowed(trigger)); 
                     if lower_case.contains(&*trigger_subst) {
                         found = true; 
                     } else {
@@ -679,7 +701,14 @@ async fn handle_triggers(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Asy
                 }
 
                 if found { 
-                    opt_response = make_response(cstate, lm, msg.name(), &multi_trigger.triggers.join(" "), &multi_trigger.value);
+                    let trigger = multi_trigger.triggers.join(" ");
+                    let context = ReplyContext
+                    {
+                        user: msg.name(),
+                        trigger: &trigger,
+                        trigger_message: msg.data(),
+                    };
+                    opt_response = make_response(cstate, lm, &context, &multi_trigger.value);
                 }
             }
             if let Some(response) = opt_response {
@@ -704,7 +733,13 @@ async fn parse_command(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Async
         let mut was_command = false;
         if let Some(MapValue::Value(command_text)) = lm.command_text.get(msg.data()) {
             println!("got command {}", command_text);
-            let result = subst_context(cstate, msg.name(), msg.data(), Cow::Borrowed(command_text));
+            let context = ReplyContext
+            {
+                user: msg.name(),
+                trigger: msg.data(),
+                trigger_message: msg.data(),
+            };
+            let result = subst_context(cstate, &context, Cow::Borrowed(command_text));
 
             cstate.force_send_message(runner, &result).await;
             was_command = true;
@@ -713,7 +748,16 @@ async fn parse_command(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Async
         let mut commands = msg.data().split_whitespace();
 
         if let Some(MapValue::Value(command)) = lm.commands.get(commands.next().unwrap_or("")) {
-            match *command {
+            let context = ReplyContext
+            {
+                user: msg.name(),
+                trigger: msg.data(),
+                trigger_message: msg.data(),
+            };
+
+            let mut map_command_split = command.split_whitespace();
+
+            match map_command_split.next().unwrap_or("") {
                 "COMMANDS" => {
                     let keys: HashSet<&str> = lm.command_text.keys().chain( lm.commands.keys() ).map(|k| k.borrow()).collect();
                     let msg: String = keys.iter().join(", ");
@@ -788,8 +832,7 @@ async fn parse_command(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Async
                             format!("starting off topic timer")
                         }
                     };
-
-                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "OFF_TOPIC", &response)).await;
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &response)).await;
                     return Ok(());
                 }
                 "ON_TOPIC" => { 
@@ -797,19 +840,41 @@ async fn parse_command(state: &mut State, lm: &ListsMaps<'_>, runner: &mut Async
                         let duration = SystemTime::now().duration_since(start).unwrap();
                         cstate.total_off_topic += duration;
                         let response = format!("{channel} is finally on topic, it took them {}h {}m {}s", duration.as_secs() / 60 / 60, duration.as_secs() / 60 % 60, duration.as_secs() % 60 );
-                        cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "ON_TOPIC", &response)).await;
+                        cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &response)).await;
                     }
                     return Ok(());
                 }
                 "TOTAL_OFF_TOPIC" => { 
                     let response = format!("The streamer has been off topic a total of {}h {}m {}s", cstate.total_off_topic.as_secs() / 60 / 60, cstate.total_off_topic.as_secs() / 60 % 60, cstate.total_off_topic.as_secs() % 60 );
-                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "TOTAL_OFF_TOPIC", &response)).await;
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &response)).await;
                     return Ok(());
                 }
                 "SET_TOPIC" => { 
                     let topic = commands.next().unwrap_or("");
                     let response = format!("current topic is now {}", topic);
-                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, msg.name(), "SET_TOPIC", &response)).await;
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &response)).await;
+                    return Ok(());
+                }
+                "RESETCD" => { 
+                    cstate.last_message = SystemTime::UNIX_EPOCH;
+                    return Ok(());
+                }
+                "REPEAT_MAPPED" => { 
+                    // TODO get the space from the input command, but its mangled from
+                    // split_whitespace
+                    let text_to_repeat = format!("{} ", map_command_split.join(" "));
+                    let repeat_count = std::cmp::min(commands.next().unwrap_or("").parse::<i32>().unwrap_or(1), 200);
+                    let repeated = (0..repeat_count).map(|_| &text_to_repeat[..]).collect::<String>();
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &repeated)).await;
+                    return Ok(());
+                }
+                "REPEAT" => { 
+                    let repeat_count = std::cmp::min(commands.next().unwrap_or("").parse::<i32>().unwrap_or(1), 200);
+                    // TODO get the space from the input command, but its mangled from
+                    // split_whitespace
+                    let text_to_repeat = format!("{} ", commands.join(" "));
+                    let repeated = (0..repeat_count).map(|_| &text_to_repeat[..]).collect::<String>();
+                    cstate.force_send_message(runner, &make_response_message(&cstate, &lm, &context, &repeated)).await;
                     return Ok(());
                 }
                 _ => {}
