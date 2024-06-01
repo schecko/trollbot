@@ -21,6 +21,7 @@ use std::error::Error;
 use std::fs::File;
 use std::hash::{ Hash, Hasher };
 use std::io::prelude::*;
+use std::path::PathBuf;
 use std::time::{ Duration, SystemTime };
 use strum::*;
 
@@ -55,6 +56,26 @@ impl<T> MinMax<T> {
     }
 }
 
+pub fn config_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("rules_config"))
+}
+
+pub fn user_dir() -> anyhow::Result<PathBuf> {
+    let mut path = dirs::home_dir().unwrap();
+    path.push("rules_cynobot");
+    Ok(path)
+}
+
+pub fn load_config_file(name: &str) -> anyhow::Result<String> { 
+    let full_path = config_dir()?.join(name);
+    load_file(&full_path)
+}
+
+pub fn load_file_rel(name: &str) -> anyhow::Result<String> { 
+    let full_path = data_dir()?.join(name);
+    load_file(&full_path)
+}
+
 async fn connect(user_config: &UserConfig, channels: &Vec<&str>) -> anyhow::Result<AsyncRunner> {
     let connector = connector::tokio::ConnectorRustTls::twitch()?;
 
@@ -72,7 +93,8 @@ async fn connect(user_config: &UserConfig, channels: &Vec<&str>) -> anyhow::Resu
 
 async fn connect_run() -> Result<(), Box<dyn Error>> {
     let channels_content = load_config_file(CONFIG_CHANNELS)?;
-    let (user_config, channels) = get_config(&channels_content)?;
+    let user_config = get_config()?;
+    let channels = parse_list(&channels_content);
 
     let runner = connect(&user_config, &channels).await?;
     println!("starting main loop"); 
