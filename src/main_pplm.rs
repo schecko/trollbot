@@ -3,17 +3,23 @@ use crate::config::*;
 use crate::file_help::*;
 use crate::list::*;
 
-use twitchchat::{
-    commands, connector, messages,
-    runner::{AsyncRunner, Status},
-    UserConfig,
-};
-use serde::{ Serialize, Deserialize };
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
-use std::hash::{ Hash, Hasher };
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::PathBuf;
-use std::time::{ Duration, SystemTime };
+use std::time::Duration;
+use std::time::SystemTime;
+use twitchchat::UserConfig;
+use twitchchat::commands;
+use twitchchat::connector;
+use twitchchat::messages;
+use twitchchat::runner::AsyncRunner;
+use twitchchat::runner::Status;
+use unicode_properties::GeneralCategoryGroup;
+use unicode_properties::UnicodeGeneralCategory;
 
 const INPUT_CHANNELS: &str = "input_channels.list";
 
@@ -86,24 +92,29 @@ impl State
 
 pub fn config_dir() -> anyhow::Result<PathBuf>
 {
-    Ok(std::env::current_dir()?.join("..").join("pplm_config").canonicalize()?)
+    println!("config_dir");
+    Ok(std::env::current_dir()?.join("pplm_config").canonicalize()?)
 }
 
 #[allow(dead_code)]
 pub fn user_dir() -> anyhow::Result<PathBuf>
 {
+    println!("user_dir");
     let mut path = dirs::home_dir().unwrap();
     path.push("pplm_cynobot");
     Ok(path)
 }
 
 pub fn load_config_file(name: &str) -> anyhow::Result<String> { 
+    println!("load_config_file -- {}", name);
     let full_path = config_dir()?.join(name);
+    println!("load_config_file -- {}", full_path.display());
     load_file(&full_path)
 }
 
 #[allow(dead_code)]
 pub fn load_file_rel(name: &str) -> anyhow::Result<String> { 
+    println!("load_file_rel -- {}", name);
     let full_path = data_dir()?.join(name);
     load_file(&full_path)
 }
@@ -160,9 +171,45 @@ async fn connect_run() -> Result<(), Box<dyn Error>>
     main_loop(state, runner).await 
 }
 
-async fn tokenize_message<'a>(_msg: &messages::Privmsg<'a>) -> Vec<&'a str>
+fn tokenize_message(msg: &messages::Privmsg<'_>) -> Vec<String>
 {
-    return vec![];
+    let mut tokens = Vec::new();
+    let mut wip_token = String::new();
+    for c in msg.data().chars()
+    {
+        let group = c.general_category_group();
+        match (group, c)
+        {
+			(GeneralCategoryGroup::Letter, _) |
+			(GeneralCategoryGroup::Number, _) |
+			(_, '\'') =>
+            {
+				wip_token.push(c);
+                continue;
+            }
+			(GeneralCategoryGroup::Mark, _) |
+			(GeneralCategoryGroup::Punctuation, _) |
+			(GeneralCategoryGroup::Symbol, _) |
+			(GeneralCategoryGroup::Separator, _) |
+			(GeneralCategoryGroup::Other, _) =>
+            {
+				if !wip_token.is_empty()
+				{
+					tokens.push(wip_token);
+					wip_token = String::new();
+				}
+				tokens.push(String::from(c));
+                continue;
+            }
+		}
+    } 
+
+    if !wip_token.is_empty()
+    {
+        tokens.push(wip_token);
+    }
+
+    tokens
 }
 
 async fn handle_message(_state: &mut State, _runner: &mut AsyncRunner, msg: messages::Commands<'_>)
@@ -173,7 +220,9 @@ async fn handle_message(_state: &mut State, _runner: &mut AsyncRunner, msg: mess
             let channel = &msg.channel()[1..]; // strip the #
             println!("[{}] {}: {}", channel, msg.name(), msg.data());
             // TODO
-            let _tokens = tokenize_message(&msg);
+            let tokens = tokenize_message(&msg);
+            println!("tokenized: {}", tokens.join("|"));
+
         },
 
         // unimplemented features from crate twitchchat
